@@ -61,6 +61,7 @@ const icons = {
   dataTable: Table2,
   drive: HardDrive,
   mcpCall: Plug,
+  pythonExec: Terminal,
 };
 
 const nodeColorMap = {
@@ -103,6 +104,7 @@ const nodeColorMap = {
   playwright: "node-playwright",
   drive: "node-drive",
   mcpCall: "node-agent",
+  pythonExec: "node-set",
 };
 
 const isSubAgentNode = computed(

@@ -9020,6 +9020,38 @@ class WorkflowExecutor:
                 mcp_result = execute_mcp_tool(mcp_connection, selected_tool, resolved_args, timeout)
                 output = {"result": mcp_result}
 
+            elif node_type == "pythonExec":
+                from app.services.skill_python_executor import (
+                    SkillExecutionResult,
+                    execute_skill_python,
+                )
+
+                code = node_data.get("code") or ""
+                if not code.strip():
+                    raise ValueError("pythonExec node requires Python code")
+                input_expr = node_data.get("inputExpression") or "$input"
+                timeout = float(node_data.get("timeoutSeconds") or 30)
+                resolved_input = self.resolve_expression(
+                    input_expr, inputs, node_id, preserve_type=True
+                )
+                resolved_input = _to_json_compatible(resolved_input)
+                skill_files = [{"path": "main.py", "content": code, "encoding": "text"}]
+                try:
+                    result: SkillExecutionResult = execute_skill_python(
+                        skill_files=skill_files,
+                        arguments={"input": json.dumps(resolved_input, default=str)},
+                        timeout_seconds=timeout,
+                    )
+                    output = (
+                        result.output
+                        if isinstance(result.output, dict)
+                        else {"result": result.output}
+                    )
+                except TimeoutError as exc:
+                    raise ValueError(f"Python execution timed out after {timeout}s") from exc
+                except Exception as exc:
+                    raise ValueError(f"Python execution error: {exc}") from exc
+
             else:
                 output = {"passthrough": inputs}
 

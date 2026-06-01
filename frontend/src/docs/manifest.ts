@@ -42,6 +42,7 @@ export const DOCS_MANIFEST: Record<string, DocCategory> = {
       { slug: "set-node", title: "Set" },
       { slug: "variable-node", title: "Variable" },
       { slug: "execute-node", title: "Execute" },
+      { slug: "python-exec-node", title: "Python Exec" },
       { slug: "http-node", title: "HTTP" },
       { slug: "websocket-send-node", title: "WebSocket Send" },
       { slug: "telegram-node", title: "Telegram" },

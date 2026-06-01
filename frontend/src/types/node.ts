@@ -577,6 +577,21 @@ export const NODE_DEFINITIONS: Record<NodeType, NodeDefinition> = {
       crawlerSelectors: [],
     },
   },
+  pythonExec: {
+    type: "pythonExec",
+    label: "Python Exec",
+    description: "Execute Python code with optional input expression",
+    color: "node-execute",
+    icon: "Terminal",
+    inputs: 1,
+    outputs: 1,
+    defaultData: {
+      label: "pythonExec",
+      code: "",
+      inputExpression: "",
+      timeoutSeconds: 30,
+    },
+  },
   consoleLog: {
     type: "consoleLog",
     label: "Console Log",

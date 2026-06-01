@@ -174,6 +174,7 @@ const icons = {
   dataTable: Table2,
   drive: HardDrive,
   mcpCall: Plug,
+  pythonExec: Terminal,
 };
 
 const allNodeTypes = Object.values(NODE_DEFINITIONS);

@@ -161,7 +161,8 @@ export type NodeType =
   | "dataTable"
   | "drive"
   | "slackTrigger"
-  | "mcpCall";
+  | "mcpCall"
+  | "pythonExec";
 
 export type VariableType =
   | "string"

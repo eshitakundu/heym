@@ -915,6 +915,12 @@ function getDefaultNodeData(type: NodeType): WorkflowNode["data"] {
       toolArguments: {},
       timeoutSeconds: 30,
     },
+    pythonExec: {
+      label: "pythonExec",
+      code: "",
+      inputExpression: "$input",
+      timeoutSeconds: 30,
+    },
   };
   return defaults[type];
 }

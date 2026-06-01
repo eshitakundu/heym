@@ -77,6 +77,7 @@ const nodeIcons: Record<NodeType, ReturnType<typeof Type>> = {
   sticky: StickyNote,
   merge: GitMerge,
   set: Settings2,
+  pythonExec: Terminal,
   jsonOutputMapper: Braces,
   telegramTrigger: MessageSquare,
   telegram: MessageSquare,
@@ -119,6 +120,7 @@ const nodeColorMap: Record<NodeType, string> = {
   sticky: "node-sticky",
   merge: "node-merge",
   set: "node-set",
+  pythonExec: "node-set",
   jsonOutputMapper: "node-output",
   telegramTrigger: "node-telegram",
   telegram: "node-telegram",
@@ -161,6 +163,7 @@ const nodeDocSlugMap: Record<NodeType, string> = {
   sticky: "sticky-note-node",
   merge: "merge-node",
   set: "set-node",
+  pythonExec: "python-exec-node",
   jsonOutputMapper: "json-output-mapper-node",
   telegramTrigger: "telegram-trigger-node",
   telegram: "telegram-node",
@@ -8380,6 +8383,37 @@ onUnmounted(() => {
                 <template v-else>
                   <div>Select an operation to see output fields</div>
                 </template>
+              </div>
+            </div>
+          </template>
+
+          <template v-if="selectedNode.type === 'pythonExec'">
+            <div class="space-y-3">
+              <div>
+                <Label>Input Expression</Label>
+                <ExpressionInput
+                  :model-value="selectedNode.data.inputExpression ?? '$input'"
+                  @update:model-value="updateNodeData('inputExpression', $event)"
+                  placeholder="$input"
+                />
+              </div>
+              <div>
+                <Label>Python Code</Label>
+                <Textarea
+                  :model-value="selectedNode.data.code ?? ''"
+                  @update:model-value="updateNodeData('code', $event)"
+                  class="font-mono text-xs min-h-[200px]"
+                  placeholder="import json, sys&#10;data = json.load(sys.stdin)&#10;# transform data here&#10;print(json.dumps(data))"
+                />
+                <p class="text-xs text-muted-foreground mt-1">Read input via <code>json.load(sys.stdin)</code>. Print JSON result to stdout.</p>
+              </div>
+              <div>
+                <Label>Timeout (seconds)</Label>
+                <Input
+                  type="number"
+                  :model-value="selectedNode.data.timeoutSeconds ?? 30"
+                  @update:model-value="updateNodeData('timeoutSeconds', Number($event))"
+                />
               </div>
             </div>
           </template>

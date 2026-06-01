@@ -77,6 +77,7 @@ export const nodeIcons: Record<NodeType, ReturnType<typeof Type>> = {
   playwright: MonitorPlay,
   drive: HardDrive,
   mcpCall: Plug,
+  pythonExec: Terminal,
 };
 
 /** Tailwind text-* classes aligned with canvas node header tints (BaseNode). */
@@ -120,4 +121,5 @@ export const nodeIconColorClass: Record<NodeType, string> = {
   playwright: "text-node-playwright",
   drive: "text-node-drive",
   mcpCall: "text-node-agent",
+  pythonExec: "text-node-execute",
 };

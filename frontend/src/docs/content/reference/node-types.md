@@ -40,6 +40,7 @@ See [Triggers](./triggers.md) for all entry points.
 | [Set](../nodes/set-node.md) | Transform and map data | 1 | 1 |
 | [Variable](../nodes/variable-node.md) | Set or get a variable (workflow-local or [global](./global-variables.md)) | 1 | 1 |
 | [Execute](../nodes/execute-node.md) | Call another workflow | 1 | 1 |
+| [Python Exec](../nodes/python-exec-node.md) | Run inline Python code on workflow data | 1 | 1 |
 
 ## Integration Nodes
 
