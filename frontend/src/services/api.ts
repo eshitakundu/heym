@@ -120,6 +120,40 @@ const api = axios.create({
   withCredentials: true,
 });
 
+function getErrorDetail(error: unknown, fallback: string): string {
+  if (axios.isAxiosError(error)) {
+    const detail = error.response?.data?.detail;
+    if (typeof detail === "string" && detail.trim()) {
+      return detail;
+    }
+  }
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  return fallback;
+}
+
+async function getFetchErrorDetail(response: Response): Promise<string> {
+  const fallback = `HTTP error! status: ${response.status}`;
+  try {
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("application/json")) {
+      const data = await response.json();
+      if (typeof data?.detail === "string" && data.detail.trim()) {
+        return data.detail;
+      }
+    } else {
+      const text = await response.text();
+      if (text.trim()) {
+        return text;
+      }
+    }
+  } catch {
+    return fallback;
+  }
+  return fallback;
+}
+
 export interface AppVersionInfo {
   version: string;
   latest_version: string | null;
@@ -1074,6 +1108,69 @@ export const credentialsApi = {
       "/credentials/bigquery/oauth/authorize",
       { credential_id: credentialId },
     );
+    return response.data;
+  },
+};
+
+export interface VoiceInfo {
+  voice_id: string;
+  name: string;
+}
+
+export interface SttResult {
+  text: string;
+  language_code: string;
+}
+
+export const voiceApi = {
+  // Same-origin GET URL for an <audio> element to stream TTS progressively.
+  // Auth is carried by the access-token cookie sent with the media request.
+  streamUrl: (text: string, opts?: { voiceId?: string; credentialId?: string }): string => {
+    const params = new URLSearchParams({ text });
+    if (opts?.voiceId) params.set("voice_id", opts.voiceId);
+    if (opts?.credentialId) params.set("credential_id", opts.credentialId);
+    return `${API_URL}/api/voice/tts/stream?${params.toString()}`;
+  },
+  listVoices: async (credentialId?: string): Promise<VoiceInfo[]> => {
+    const response = await api.get<VoiceInfo[]>("/voice/voices", {
+      params: credentialId ? { credential_id: credentialId } : undefined,
+    });
+    return response.data;
+  },
+  tts: async (
+    text: string,
+    opts?: { voiceId?: string; credentialId?: string },
+  ): Promise<Blob> => {
+    const response = await api.post(
+      "/voice/tts",
+      { text, voice_id: opts?.voiceId, credential_id: opts?.credentialId },
+      { responseType: "blob" },
+    );
+    return response.data as Blob;
+  },
+  stt: async (blob: Blob): Promise<SttResult> => {
+    const formData = new FormData();
+    formData.append("file", blob, "audio.webm");
+    const response = await api.post<SttResult>("/voice/stt", formData, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
+    return response.data;
+  },
+};
+
+export interface ObservabilityStatus {
+  enabled: boolean;
+  endpoint: string;
+  service_name: string;
+  sampler_ratio: number;
+  capture_node_io: boolean;
+  instrumented: string[];
+  spans: string[];
+}
+
+export const observabilityApi = {
+  getStatus: async (): Promise<ObservabilityStatus> => {
+    const response = await api.get<ObservabilityStatus>("/config/observability");
     return response.data;
   },
 };
@@ -2128,11 +2225,15 @@ export const logsApi = {
     if (since) {
       params.since = since;
     }
-    const response = await api.get<{ logs: string; container: string }>(
-      `/logs/docker/${containerName}`,
-      { params },
-    );
-    return response.data.logs;
+    try {
+      const response = await api.get<{ logs: string; container: string }>(
+        `/logs/docker/${containerName}`,
+        { params },
+      );
+      return response.data.logs;
+    } catch (error) {
+      throw new Error(getErrorDetail(error, "Failed to load Docker logs"));
+    }
   },
 
   streamDockerLogs: (
@@ -2149,7 +2250,7 @@ export const logsApi = {
     })
       .then(async (response) => {
         if (!response.ok) {
-          throw new Error(`HTTP error! status: ${response.status}`);
+          throw new Error(await getFetchErrorDetail(response));
         }
 
         const reader = response.body?.getReader();

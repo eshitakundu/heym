@@ -5,6 +5,7 @@ import { AlertTriangle, Ban, Bot, Brain, Braces, Bug, CalendarClock, Clock, Data
 import type { NodeTemplate } from "@/features/templates/types/template.types";
 import type { NodeType, WorkflowEdge, WorkflowNode } from "@/types/workflow";
 
+import TemplatesBrowseDialog from "@/features/templates/components/TemplatesBrowseDialog.vue";
 import { buildWorkflowNodeFromNodeTemplate } from "@/lib/nodeFromTemplate";
 import {
   INPUT_HANDLE,
@@ -19,6 +20,7 @@ import { templatesApi } from "@/services/api";
 import { useAuthStore } from "@/stores/auth";
 import { useWorkflowStore } from "@/stores/workflow";
 import { NODE_DEFINITIONS } from "@/types/node";
+import { useRunbookPlayer } from "@/features/runbook/useRunbookPlayer";
 
 const workflowStore = useWorkflowStore();
 const authStore = useAuthStore();
@@ -26,6 +28,13 @@ const searchInputRef = ref<HTMLInputElement | null>(null);
 const selectedIndex = ref<number>(-1);
 const nodeTemplates = ref<NodeTemplate[]>([]);
 const templatesLoadError = ref(false);
+const showTemplatesBrowse = ref(false);
+const templatesBrowseQuery = ref("");
+
+function openTemplatesBrowse(): void {
+  templatesBrowseQuery.value = searchQuery.value.trim();
+  showTemplatesBrowse.value = true;
+}
 
 async function loadNodeTemplates(): Promise<void> {
   try {
@@ -179,7 +188,15 @@ const icons = {
 
 const allNodeTypes = Object.values(NODE_DEFINITIONS);
 
+const { isRunbookPlaying } = useRunbookPlayer();
+
+/** While the runbook demo plays, the panel shows only the nodes it builds. */
+const RUNBOOK_PANEL_NODE_TYPES: NodeType[] = ["textInput", "wait", "consoleLog"];
+
 const nodeTypes = computed(() => {
+  if (isRunbookPlaying.value) {
+    return RUNBOOK_PANEL_NODE_TYPES.map((type) => NODE_DEFINITIONS[type]);
+  }
   const query = searchQuery.value.toLowerCase().trim();
   if (!query) return allNodeTypes;
   return allNodeTypes.filter(
@@ -453,6 +470,7 @@ function handleDoubleClick(type: NodeType): void {
 
 <template>
   <div
+    data-runbook-panel
     :class="cn(
       'node-panel w-80 sm:w-72 md:w-[280px] border-r border-border/40 p-4 flex flex-col h-full transition-all max-w-full overflow-x-hidden',
       hasPendingAction && 'ring-2 ring-primary/40 ring-inset'
@@ -463,7 +481,7 @@ function handleDoubleClick(type: NodeType): void {
         Nodes
         <span
           v-if="workflowStore.pendingInsertEdge"
-          class="text-xs font-medium text-primary px-2 py-0.5 rounded-full bg-primary/10"
+          class="rounded-full bg-primary/15 px-2 py-0.5 text-xs font-medium text-primary dark:bg-primary/25 dark:text-violet-200"
         >
           Insert
         </span>
@@ -472,7 +490,10 @@ function handleDoubleClick(type: NodeType): void {
         <span class="hidden sm:inline">{{ paletteRows.length }} available</span>
       </span>
     </div>
-    <div class="relative mb-4 shrink-0">
+    <div
+      v-if="!isRunbookPlaying"
+      class="relative mb-4 shrink-0"
+    >
       <Search class="absolute left-3.5 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
       <input
         ref="searchInputRef"
@@ -497,7 +518,7 @@ function handleDoubleClick(type: NodeType): void {
       </button>
     </div>
     <div class="flex-1 overflow-y-auto min-h-0 scrollbar-thin">
-      <div class="space-y-2 pr-1">
+      <div :class="cn('space-y-2 pr-1', isRunbookPlaying && 'pl-1.5')">
         <div
           v-for="(node, index) in nodeTypes"
           :key="node.type"
@@ -506,7 +527,8 @@ function handleDoubleClick(type: NodeType): void {
           :class="cn(
             'node-item flex items-center gap-3 p-3 rounded-xl border border-border/40 cursor-grab transition-all duration-200 min-h-[44px]',
             'hover:border-primary/40 hover:bg-accent/50 hover:shadow-sm active:cursor-grabbing',
-            selectedIndex === index && 'border-primary bg-accent ring-2 ring-primary/20'
+            selectedIndex === index && 'border-primary bg-accent ring-2 ring-primary/20',
+            isRunbookPlaying && 'runbook-pulse-sm border-primary/50'
           )
           "
           @mousedown="handleMouseDown"
@@ -537,7 +559,7 @@ function handleDoubleClick(type: NodeType): void {
             </div>
           </div>
         </div>
-        <template v-if="filteredNodeTemplates.length > 0 || templatesLoadError">
+        <template v-if="!isRunbookPlaying && (filteredNodeTemplates.length > 0 || templatesLoadError)">
           <div class="pt-4 pb-1">
             <h3 class="text-xs font-semibold uppercase tracking-wide text-muted-foreground flex items-center gap-2">
               <LayoutTemplate class="w-3.5 h-3.5" />
@@ -594,18 +616,52 @@ function handleDoubleClick(type: NodeType): void {
         </template>
         <div
           v-if="paletteRows.length === 0"
-          class="text-center py-8"
+          class="py-8"
         >
-          <Search class="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
-          <p class="text-sm text-muted-foreground">
-            No nodes found
-          </p>
-          <p class="text-xs text-muted-foreground/60 mt-1">
-            Try a different search term
-          </p>
+          <div class="text-center mb-4">
+            <Search class="w-8 h-8 text-muted-foreground/40 mx-auto mb-3" />
+            <p class="text-sm text-muted-foreground">
+              No nodes found
+            </p>
+            <p class="text-xs text-muted-foreground/60 mt-1">
+              Try a different search term
+            </p>
+          </div>
+          <button
+            type="button"
+            class="node-item w-full flex items-center gap-3 p-3 rounded-xl border border-border/40 cursor-pointer transition-all duration-200 min-h-[44px] text-left hover:border-primary/40 hover:bg-accent/50 hover:shadow-sm"
+            @click="openTemplatesBrowse"
+          >
+            <div
+              class="node-icon flex items-center justify-center w-10 h-10 rounded-xl shrink-0 transition-all duration-200"
+            >
+              <img
+                src="/fav.svg"
+                alt=""
+                aria-hidden="true"
+                class="w-8 h-8 rounded-lg"
+              >
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="font-medium text-sm leading-tight">
+                Search Heym templates
+              </div>
+              <div class="text-xs text-muted-foreground line-clamp-1 mt-0.5">
+                {{ searchQuery.trim()
+                  ? `Find "${searchQuery.trim()}" in public templates`
+                  : "Browse public templates to bring to canvas" }}
+              </div>
+            </div>
+          </button>
         </div>
       </div>
     </div>
+
+    <TemplatesBrowseDialog
+      :open="showTemplatesBrowse"
+      :query="templatesBrowseQuery"
+      @close="showTemplatesBrowse = false"
+    />
   </div>
 </template>
 

@@ -22,6 +22,7 @@ import {
 interface Props {
   open: boolean;
   credential?: Credential | null;
+  presetType?: CredentialType;
 }
 
 const props = defineProps<Props>();
@@ -89,6 +90,7 @@ const error = ref("");
 const typeOptions = [
   { value: "openai", label: CREDENTIAL_TYPE_LABELS.openai },
   { value: "google", label: CREDENTIAL_TYPE_LABELS.google },
+  { value: "elevenlabs", label: CREDENTIAL_TYPE_LABELS.elevenlabs },
   { value: "custom", label: CREDENTIAL_TYPE_LABELS.custom },
   { value: "bearer", label: CREDENTIAL_TYPE_LABELS.bearer },
   { value: "header", label: CREDENTIAL_TYPE_LABELS.header },
@@ -161,7 +163,7 @@ watch(
         bqConnectedCredential.value = null;
       } else {
         name.value = "";
-        type.value = "openai";
+        type.value = props.presetType ?? "openai";
         apiKey.value = "";
         baseUrl.value = "";
         bearerToken.value = "";
@@ -216,7 +218,7 @@ watch(
 const isValid = computed(() => {
   if (!name.value.trim()) return false;
 
-  if (type.value === "openai" || type.value === "google") {
+  if (type.value === "openai" || type.value === "google" || type.value === "elevenlabs") {
     return !!apiKey.value.trim() || isEditing.value;
   } else if (type.value === "custom") {
     return (!!apiKey.value.trim() && !!baseUrl.value.trim()) || isEditing.value;
@@ -283,6 +285,8 @@ function buildConfig(): CredentialConfig {
   if (type.value === "openai") {
     return { api_key: apiKey.value };
   } else if (type.value === "google") {
+    return { api_key: apiKey.value };
+  } else if (type.value === "elevenlabs") {
     return { api_key: apiKey.value };
   } else if (type.value === "custom") {
     return { base_url: baseUrl.value, api_key: apiKey.value };
@@ -394,8 +398,6 @@ async function startGoogleSheetsOAuth(): Promise<void> {
 
     const popup = window.open(auth_url, "google-oauth", "width=520,height=620");
 
-    let pollClosed: ReturnType<typeof setInterval>;
-
     const onMessage = (evt: MessageEvent): void => {
       if (evt.data?.type === "google-oauth-success" && evt.data.credentialId === credId) {
         window.removeEventListener("message", onMessage);
@@ -417,16 +419,16 @@ async function startGoogleSheetsOAuth(): Promise<void> {
         error.value = evt.data.message || "OAuth authorization failed";
       }
     };
-    window.addEventListener("message", onMessage);
 
-    // Detect popup closed without completing
-    pollClosed = setInterval(() => {
+    const pollClosed = setInterval(() => {
       if (popup?.closed) {
         clearInterval(pollClosed);
         window.removeEventListener("message", onMessage);
         gsOAuthConnecting.value = false;
       }
     }, 500);
+
+    window.addEventListener("message", onMessage);
   } catch (err) {
     gsOAuthConnecting.value = false;
     error.value = err instanceof Error ? err.message : "OAuth authorization failed";
@@ -466,8 +468,6 @@ async function startBigQueryOAuth(): Promise<void> {
     const { auth_url } = await credentialsApi.bigQueryOAuthAuthorize(credId);
     const popup = window.open(auth_url, "bq-oauth", "width=520,height=620");
 
-    let pollClosed: ReturnType<typeof setInterval>;
-
     const onMessage = (evt: MessageEvent): void => {
       if (evt.data?.type === "google-oauth-success" && evt.data.credentialId === credId) {
         window.removeEventListener("message", onMessage);
@@ -488,15 +488,16 @@ async function startBigQueryOAuth(): Promise<void> {
         error.value = evt.data.message || "OAuth authorization failed";
       }
     };
-    window.addEventListener("message", onMessage);
 
-    pollClosed = setInterval(() => {
+    const pollClosed = setInterval(() => {
       if (popup?.closed) {
         clearInterval(pollClosed);
         window.removeEventListener("message", onMessage);
         bqOAuthConnecting.value = false;
       }
     }, 500);
+
+    window.addEventListener("message", onMessage);
   } catch (err) {
     bqOAuthConnecting.value = false;
     error.value = err instanceof Error ? err.message : "OAuth authorization failed";
@@ -637,7 +638,7 @@ async function handleSave(): Promise<void> {
       </div>
 
       <div
-        v-if="type === 'openai' || type === 'google'"
+        v-if="type === 'openai' || type === 'google' || type === 'elevenlabs'"
         class="space-y-2"
       >
         <Label for="cred-api-key">API Key</Label>
@@ -665,6 +666,14 @@ async function handleSave(): Promise<void> {
             />
           </button>
         </div>
+        <p
+          v-if="type === 'elevenlabs'"
+          class="text-xs text-muted-foreground"
+        >
+          Grant this API key the <strong>Text to Speech</strong>,
+          <strong>Speech to Text</strong>, and <strong>Voices</strong> permissions in your
+          ElevenLabs account.
+        </p>
       </div>
 
       <template v-if="type === 'custom'">

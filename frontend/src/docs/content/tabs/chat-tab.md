@@ -39,11 +39,11 @@ This is best for requests where you want the work done as a reusable automation,
 
 ## User Rules
 
-[User Rules](../reference/user-settings.md) (configured in User Settings) are automatically injected into every Chat conversation as system-level instructions. Set them once to apply persistent preferences to all chat requests.
+[User Rules](../reference/user-settings.md) (configured in Settings) are automatically injected into every Chat conversation as system-level instructions. Set them once to apply persistent preferences to all chat requests.
 
 ## Related
 
-- [User Settings](../reference/user-settings.md) – Set User Rules applied to all chat requests
+- [Settings](../reference/user-settings.md) – Set User Rules applied to all chat requests
 - [Credentials Tab](./credentials-tab.md) – Add and manage API keys
 - [Variables Tab](./global-variables-tab.md) – Global variables available to Chat
 - [Node Types](../reference/node-types.md) – LLM and Agent nodes for workflows
@@ -52,6 +52,7 @@ This is best for requests where you want the work done as a reusable automation,
 - [Execution History](../reference/execution-history.md) – View past runs (History button in header)
 - [Scheduled Tab](./scheduled-tab.md) – Calendar of upcoming cron runs (same data Chat can summarize)
 - [Contextual Showcase](../reference/contextual-showcase.md) – Compact in-app orientation for this page
+- [Chat Voice (TTS & STT)](../reference/chat-voice.md) – Read messages aloud and talk hands-free with ElevenLabs
 
 ## Tool calls and context size
 

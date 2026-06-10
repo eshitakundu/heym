@@ -10,6 +10,7 @@ import type { WorkflowListItem } from "@/types/workflow";
 import TraceDurationChart, { type TraceSpan } from "@/components/Traces/TraceDurationChart.vue";
 import TracesStatsHeader from "@/components/Traces/TracesStatsHeader.vue";
 import TracesTimeRangeSelect from "@/components/Traces/TracesTimeRangeSelect.vue";
+import TraceStepsTimeline from "@/components/Traces/TraceStepsTimeline.vue";
 import Button from "@/components/ui/Button.vue";
 import Card from "@/components/ui/Card.vue";
 import Dialog from "@/components/ui/Dialog.vue";
@@ -18,6 +19,7 @@ import Select from "@/components/ui/Select.vue";
 import { onDismissOverlays, pushOverlayState } from "@/composables/useOverlayBackHandler";
 import { cn, formatDate } from "@/lib/utils";
 import { credentialsApi, traceApi, workflowApi } from "@/services/api";
+import { buildTraceSteps, type TraceStep } from "@/lib/traceSteps";
 
 interface SelectOption {
   value: string;
@@ -74,6 +76,7 @@ interface ToolCallEntry {
   elapsed_ms?: number;
   source?: string;
   mcp_server?: string;
+  workflow_name?: string;
 }
 
 function getToolCallsFromResponse(response: Record<string, unknown> | null): ToolCallEntry[] | undefined {
@@ -233,6 +236,27 @@ const spans = computed(() =>
   selectedTrace.value ? buildTraceSpans(selectedTrace.value) : []
 );
 
+const workflowNames = computed<Record<string, string>>(() =>
+  Object.fromEntries(workflows.value.map((workflow) => [workflow.id, workflow.name])),
+);
+
+/** Resolve the executed workflow's display name for a tool call (workflow-execution tools). */
+function toolCallWorkflowLabel(tc: ToolCallEntry): string | null {
+  const explicit = typeof tc.workflow_name === "string" ? tc.workflow_name.trim() : "";
+  if (explicit) return explicit;
+  const workflowId = tc.arguments?.workflow_id;
+  if (typeof workflowId === "string" && workflowId.trim()) {
+    return workflowNames.value[workflowId.trim()] ?? `${workflowId.trim().slice(0, 8)}…`;
+  }
+  return null;
+}
+
+const steps = computed<TraceStep[]>(() =>
+  selectedTrace.value
+    ? buildTraceSteps(selectedTrace.value, { workflowNames: workflowNames.value })
+    : [],
+);
+
 async function copyToClipboard(text: string, type: "request" | "response"): Promise<void> {
   try {
     await navigator.clipboard.writeText(text);
@@ -385,6 +409,14 @@ function getStatusClass(status: string): string {
 function formatMillis(value: number | null): string {
   if (value === null || Number.isNaN(value)) return "-";
   return `${Math.round(value)} ms`;
+}
+
+function formatCost(value: string | null): string {
+  if (value === null) return "Unpriced";
+  const parsed = parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed === 0) return "$0.00";
+  if (parsed < 0.01) return `$${parsed.toFixed(4)}`;
+  return `$${parsed.toFixed(2)}`;
 }
 
 function formatJson(value: unknown): string {
@@ -674,7 +706,7 @@ onMounted(async () => {
             variant="outline"
             size="sm"
             class="h-9 md:h-9 text-xs"
-            :disabled="!hasPrevious"
+            :disabled="loading || !hasPrevious"
             @click="goPrevious"
           >
             <ChevronLeft class="w-3 h-3 md:w-4 md:h-4" />
@@ -684,7 +716,7 @@ onMounted(async () => {
             variant="outline"
             size="sm"
             class="h-9 md:h-9 text-xs"
-            :disabled="!hasNext"
+            :disabled="loading || !hasNext"
             @click="goNext"
           >
             <span class="hidden sm:inline">Next</span>
@@ -695,14 +727,14 @@ onMounted(async () => {
     </div>
 
     <div
-      v-if="loading"
+      v-if="loading && traces.length === 0"
       class="text-sm text-muted-foreground text-center py-10"
     >
       Loading traces...
     </div>
 
     <div
-      v-else-if="error"
+      v-else-if="error && traces.length === 0"
       class="text-sm text-destructive text-center py-10"
     >
       {{ error }}
@@ -717,7 +749,9 @@ onMounted(async () => {
 
     <div
       v-else
-      class="grid gap-3"
+      class="grid gap-3 transition-opacity duration-150"
+      :class="cn(loading && 'pointer-events-none opacity-60')"
+      :aria-busy="loading"
     >
       <Card
         v-for="(trace, index) in traces"
@@ -762,6 +796,11 @@ onMounted(async () => {
           <div class="flex flex-wrap items-center gap-4 text-xs text-muted-foreground">
             <span>{{ trace.request_type }}</span>
             <span v-if="trace.total_tokens !== null">{{ trace.total_tokens }} tokens</span>
+            <span
+              v-if="trace.cost_usd !== null"
+            >
+              Cost {{ formatCost(trace.cost_usd) }}
+            </span>
             <span>{{ formatMillis(trace.elapsed_ms) }}</span>
           </div>
         </button>
@@ -962,7 +1001,7 @@ onMounted(async () => {
             <span
               v-for="(s, i) in getSkillsFromRequest(selectedTrace.request)"
               :key="i"
-              class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary"
+              class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary dark:bg-primary/25 dark:text-accent-foreground"
             >
               {{ s }}
             </span>
@@ -988,15 +1027,21 @@ onMounted(async () => {
                 </span>
                 <span
                   v-if="tc.source === 'mcp'"
-                  class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary dark:bg-primary/25 dark:text-accent-foreground"
                 >
                   MCP{{ tc.mcp_server ? `: ${tc.mcp_server}` : '' }}
                 </span>
                 <span
                   v-else-if="tc.source === 'skill'"
-                  class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary dark:bg-primary/25 dark:text-accent-foreground"
                 >
                   Skill
+                </span>
+                <span
+                  v-if="toolCallWorkflowLabel(tc)"
+                  class="text-[10px] px-1.5 py-0.5 rounded bg-primary/20 text-primary dark:bg-primary/25 dark:text-accent-foreground"
+                >
+                  Workflow: {{ toolCallWorkflowLabel(tc) }}
                 </span>
               </div>
               <div class="mt-2 text-xs text-muted-foreground break-all">
@@ -1005,6 +1050,11 @@ onMounted(async () => {
             </div>
           </div>
         </div>
+
+        <TraceStepsTimeline
+          v-if="steps.length > 0"
+          :steps="steps"
+        />
 
         <div class="space-y-2">
           <div class="flex items-center justify-between">

@@ -21,6 +21,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
 [![Commons Clause](https://img.shields.io/badge/Condition-Commons%20Clause-orange.svg?style=flat-square)](COMMONS-CLAUSE.md)
+[![Heym Version](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fraw.githubusercontent.com%2Fheymrun%2Fheym%2Fmain%2Ffrontend%2Fpackage.json&query=%24.version&label=Heym&prefix=v&color=blueviolet&style=flat-square)](https://github.com/heymrun/heym/releases)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
 [![Vue.js](https://img.shields.io/badge/Vue.js-3.x-4FC08D?style=flat-square&logo=vue.js&logoColor=white)](https://vuejs.org)
@@ -196,6 +197,18 @@ For a complete list of all features with short descriptions, see **[Full Feature
 
 ---
 
+## ⭐ Stay Up To Date
+
+<div align="center">
+
+![Workflow Creation Demo](./docs/screenshots/heym-star.gif)
+
+</div>
+
+Heym Built for developers who want control and enterprise teams that need a trusted path to production. Star Heym ⭐ on GitHub to follow releases and help more builders discover it.
+
+---
+
 ## 🎯 Why Heym?
 
 | Capability | **Heym** | n8n | Zapier | Make.com |
@@ -217,6 +230,7 @@ For a complete list of all features with short descriptions, see **[Full Feature
 | Data Tables | ✅ | ✅ | ✅ | ❌ |
 | Workflow Templates | ✅ | ✅ | ✅ | ✅ |
 | LLM trace inspection | ✅ | limited⁴ | ❌ | ✅ |
+| OpenTelemetry tracing export | ✅ | ✅¹⁷ | ❌¹⁷ | ❌¹⁷ |
 | LLM token cost tracking (USD) | ✅ | ❌¹⁶ | ❌¹⁶ | limited¹⁶ |
 | Built-in evals for AI workflows | ✅ | ✅ | ❌ | ❌ |
 | Parallel DAG execution | ✅ | limited⁹ | ❌ | ❌ |
@@ -242,6 +256,7 @@ For a complete list of all features with short descriptions, see **[Full Feature
 14. Make's official docs cover Webhooks modules and HTTP(S) request modules, but I couldn't find a native WebSocket trigger or send module
 15. As of April 22, 2026, n8n's official docs document HTTP batching and loop/wait patterns rather than a native LLM batch-status branch, Zapier's official ChatGPT app docs list no triggers and only a generic API Request beta, and Make's official OpenAI integration page exposes batch actions like create/watch completed but not a first-class status-branching LLM node, so n8n/Make are marked partial and Zapier is marked unavailable for this specific pattern
 16. n8n has no native LLM token cost tracking; community workaround workflows exist (e.g. "Token Estim8r") but require manual installation and post-execution API calls — an open feature request exists as of May 2026. Zapier exposes no per-execution token count or USD cost to users; AI steps consume tasks only, with no model pricing table. Make switched to a credits model in August 2025 that partially reflects token consumption for Make-hosted AI, but third-party connections using your own API key are billed as 1 operation = 1 credit with no token counting, and there is no per-execution USD breakdown by model
+17. Heym emits native OpenTelemetry spans (one per workflow run plus one per node) over OTLP/HTTP to any compatible backend, with W3C trace-context propagation and no instrumentation code, configured via `HEYM_OTEL_*` env vars and disabled by default. n8n has a documented OpenTelemetry tracing setup for workflow and node executions (blog.n8n.io). Zapier and Make.com do not document OpenTelemetry export of their workflow/scenario executions as of June 2026
 
 </details>
 
@@ -252,13 +267,23 @@ For a complete list of all features with short descriptions, see **[Full Feature
 ```bash
 git clone https://github.com/heymrun/heym.git
 cd heym
-cp .env.example .env
 ./run.sh
 
-# OR — with .env file
+# OR — with .env file (run.sh auto-generates SECRET_KEY and ENCRYPTION_KEY)
 git clone https://github.com/heymrun/heym.git
 cd heym
 cp .env.example .env
+./run.sh
+
+# OR — Docker with .env file
+git clone https://github.com/heymrun/heym.git
+cd heym
+cp .env.example .env
+# Generate required keys and write them into the placeholder lines copied from
+# .env.example (replace in place — appending with >> would create duplicate entries):
+SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_urlsafe(32))")
+ENCRYPTION_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+sed -i.bak "s|^SECRET_KEY=.*|SECRET_KEY=${SECRET_KEY}|; s|^ENCRYPTION_KEY=.*|ENCRYPTION_KEY=${ENCRYPTION_KEY}|" .env && rm -f .env.bak
 docker run --env-file .env \
   -p 4017:4017 \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -278,13 +303,14 @@ docker run \
 
 Open the editor in your browser at port `4017` in either setup.
 For direct `docker run` setups, the `data/files` mount keeps Drive uploads and skill-generated files available across container restarts.
+The Docker socket mount supports Docker-based MCP stdio tools and grants broad host control. Docker log access remains disabled unless you also set `DOCKER_LOGS_ENABLED=true` and `DOCKER_LOGS_ALLOWED_EMAILS=admin@example.com` for trusted users. Create the trusted admin account before enabling Docker logs, or keep `ALLOW_REGISTER=false`, so an unverified self-registration cannot claim an allow-listed email.
 
 <details>
 <summary><b>🐳 Docker Production Deployment</b></summary>
 
 ```bash
 cp .env.example .env
-./deploy.sh              # Build and deploy all services
+./deploy.sh              # Build and deploy (auto-generates keys if empty)
 ./deploy.sh --down       # Stop services
 ./deploy.sh --logs       # View logs
 ./deploy.sh --restart    # Restart services
@@ -457,6 +483,9 @@ Every trace records input and output token counts alongside a real-time USD cost
 ### Evals
 Define test cases with expected outputs. Run the entire suite with one click. Review pass/fail, actual vs expected, and historical run data. Ship AI workflows with confidence.
 
+### OpenTelemetry Tracing
+Export a root span per workflow run plus a child span per node over OTLP/HTTP to Jaeger, Grafana Tempo, Honeycomb, Datadog, or any OpenTelemetry backend. Spans carry workflow id, node type, status, duration, and LLM token usage, with W3C trace context propagated across inbound webhooks, outbound HTTP, and sub-workflows. Disabled by default; turn it on with the `HEYM_OTEL_*` environment variables and review status under **Settings → Observability**. See the in-app docs (Reference > OpenTelemetry Tracing) for details.
+
 ---
 
 ## 💬 Portal
@@ -548,6 +577,13 @@ heym/
 | `BACKEND_PORT` | Backend server port | `10105` |
 | `FRONTEND_PORT` | Frontend server port | `4017` |
 | `ALLOW_REGISTER` | Enable user registration | `true` |
+| `REQUEST_BODY_MAX_SIZE_MB` | Maximum backend HTTP request body size; defaults to `100`, one MB above `FILE_MAX_SIZE_MB` to allow multipart overhead | `100` |
+| `HEYM_OTEL_ENABLED` | Enable OpenTelemetry tracing for workflow and node executions | `false` |
+| `HEYM_OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP/HTTP base endpoint, e.g. `http://collector:4318` (spans posted to `/v1/traces`) | — |
+| `HEYM_OTEL_EXPORTER_OTLP_HEADERS` | Comma-separated `key=value` exporter headers for auth | — |
+| `HEYM_OTEL_SERVICE_NAME` | `service.name` resource attribute | `heym` |
+| `HEYM_OTEL_TRACES_SAMPLER_RATIO` | Parent-based head sampling ratio (`0.0`–`1.0`) | `1.0` |
+| `HEYM_OTEL_CAPTURE_NODE_IO` | Attach truncated node input/output to node spans | `false` |
 
 ---
 
@@ -604,6 +640,14 @@ Join our Discord to connect with the community, ask questions, share workflows, 
 
 ---
 
+## 🧩 Share a Template
+
+Want to publish a workflow template for the community? You can now submit it directly from the **[Templates page](https://heym.run/submit)** — open the dialog, paste your workflow DSL, and send it for review. No pull request needed.
+
+If you'd rather contribute through code, please **[start a Discussion](https://github.com/heymrun/heym/discussions)** so we can talk it through together **before** opening a pull request.
+
+---
+
 ## 🏢 Enterprise
 
 Commercial use, enterprise licensing, and professional support are available.
@@ -622,7 +666,7 @@ Commercial use, enterprise licensing, and professional support are available.
 
 **Built with ❤️ using Vue.js, FastAPI, and a lot of LLM tokens.**
 
-[⭐ Star this repo](https://github.com/heymrun/heym/stargazers) · [🐛 Report a bug](https://github.com/heymrun/heym/issues) · [💡 Request a feature](https://github.com/heymrun/heym/issues)
+[⭐ Star this repo](https://github.com/heymrun/heym/stargazers) · [🐛 Report a bug](https://github.com/heymrun/heym/issues) · [💡 Request a feature](https://github.com/heymrun/heym/discussions)
 
 ## ⭐ Star History
 
@@ -637,7 +681,7 @@ Commercial use, enterprise licensing, and professional support are available.
 ## Contributors
 
 <a href="https://github.com/heymrun/heym/graphs/contributors">
-  <img alt="Heym contributors" src="https://contrib.rocks/image?repo=heymrun/heym" />
+  <img alt="Heym contributors" src="https://contrib.rocks/image?repo=heymrun/heym&amp;v=0.0.39" />
 </a>
 
 </div>

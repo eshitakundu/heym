@@ -43,15 +43,19 @@ from app.api import (
     templates,
     traces,
     vector_stores,
+    voice,
     workflows,
 )
 from app.api.deps import get_client_ip
 from app.config import settings
 from app.db.session import async_session_maker
 from app.http_identity import HEYM_SERVER_AGENT
+from app.middleware.request_body_limit import RequestBodySizeLimitMiddleware
 from app.models.schemas import AppVersionResponse
+from app.observability.tracing import setup_tracing, shutdown_tracing
 from app.services.cron_scheduler import cron_scheduler
 from app.services.distributed_lock import lock_service
+from app.services.execution_cancellation import active_execution_registry
 from app.services.grist_pool import close_all_clients as close_grist_clients
 from app.services.grist_pool import warm_up_pools as warm_up_grist_pools
 from app.services.hitl_service import build_public_base_url, build_review_url
@@ -121,16 +125,19 @@ async def lifespan(app: FastAPI):
     if qdrant_count > 0:
         logger.info("Qdrant pools warmed up: %d", qdrant_count)
 
+    await active_execution_registry.start()
     await cron_scheduler.start()
     await imap_trigger_manager.start()
     await rabbitmq_consumer_manager.start()
     await websocket_trigger_manager.start()
     yield
+    shutdown_tracing()
     await websocket_trigger_manager.stop()
     await rabbitmq_consumer_manager.stop()
     await imap_trigger_manager.stop()
     await RabbitMQPool.close_all()
     await cron_scheduler.stop()
+    await active_execution_registry.stop()
     await lock_service.stop()
     close_redis_pools()
     close_grist_clients()
@@ -185,6 +192,15 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Initialize OpenTelemetry tracing (no-op unless HEYM_OTEL_ENABLED=true). Must run
+# against the app instance so FastAPI inbound-context instrumentation can attach.
+setup_tracing(app)
+
+# Register before CORS so oversized-request 413 responses still receive CORS headers.
+app.add_middleware(
+    RequestBodySizeLimitMiddleware,
+    max_body_size=settings.request_body_max_size_mb * 1024 * 1024,
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins_list,
@@ -231,6 +247,7 @@ app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"]
 app.include_router(logs.router, prefix="/api/logs", tags=["Logs"])
 app.include_router(evals.router, prefix="/api/evals", tags=["Evals"])
 app.include_router(chats.router, prefix="/api/chats", tags=["Chats"])
+app.include_router(voice.router, prefix="/api/voice", tags=["Voice"])
 app.include_router(expressions.router, prefix="/api/expressions", tags=["Expressions"])
 app.include_router(templates.router, prefix="/api/templates", tags=["Templates"])
 app.include_router(teams.router, prefix="/api/teams", tags=["Teams"])

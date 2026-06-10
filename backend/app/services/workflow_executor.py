@@ -3,6 +3,7 @@ import asyncio
 import copy
 import gc
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import random
 import re
 import shlex
 import signal
+import socket
 import time
 import uuid
 from collections import deque
@@ -21,13 +23,14 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
 from threading import Event, Lock, Thread, local
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import quote, unquote, urljoin, urlparse
 
 import httpx
 from simpleeval import DEFAULT_FUNCTIONS, EvalWithCompoundTypes, SimpleEval
 
 from app.api.data_tables import _coerce_row_data
 from app.http_identity import HEYM_USER_AGENT
+from app.observability import tracing
 from app.services.execution_cancellation import (
     clear_execution as _clear_sub_execution,
 )
@@ -43,6 +46,9 @@ from app.services.timezone_utils import get_configured_timezone, normalize_datet
 from app.services.websocket_utils import send_websocket_message
 
 logger = logging.getLogger(__name__)
+
+_DRIVE_DOWNLOAD_MAX_REDIRECTS = 5
+_DRIVE_DOWNLOAD_REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 
 
 # Dict methods that commonly collide with JSON keys when using dot access (e.g. `$data.items`).
@@ -107,6 +113,116 @@ def run_async(coro):
             return loop.run_until_complete(coro)
     except RuntimeError:
         return asyncio.run(coro)
+
+
+@dataclass(frozen=True)
+class _DriveDownloadTarget:
+    original_url: str
+    request_url: str
+    host_header: str
+    sni_hostname: str | None
+
+
+def _format_host_for_url(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    if isinstance(address, ipaddress.IPv6Address):
+        return f"[{address.compressed}]"
+    return address.compressed
+
+
+def _format_host_header(hostname: str, scheme: str, port: int | None) -> str:
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    if port is not None and port != (443 if scheme == "https" else 80):
+        return f"{hostname}:{port}"
+    return hostname
+
+
+def _resolve_drive_download_addresses(
+    hostname: str,
+) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    host = hostname.strip("[]")
+    if "%" in host:
+        host = host.split("%", 1)[0]
+
+    try:
+        return [ipaddress.ip_address(host)]
+    except ValueError:
+        pass
+
+    try:
+        resolved = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise ValueError(f"Drive Node: failed to resolve download URL host: {hostname}") from exc
+
+    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    seen: set[str] = set()
+    for family, _, _, _, sockaddr in resolved:
+        if family not in (socket.AF_INET, socket.AF_INET6):
+            continue
+        address = ipaddress.ip_address(sockaddr[0].split("%", 1)[0])
+        address_key = address.compressed
+        if address_key in seen:
+            continue
+        seen.add(address_key)
+        addresses.append(address)
+
+    if not addresses:
+        raise ValueError(f"Drive Node: failed to resolve download URL host: {hostname}")
+    return addresses
+
+
+def _resolve_drive_download_target(raw_url: str) -> _DriveDownloadTarget:
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Drive Node: source URL must use http or https")
+    if not parsed.hostname:
+        raise ValueError("Drive Node: source URL must include a host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Drive Node: source URL includes an invalid port") from exc
+
+    addresses = _resolve_drive_download_addresses(parsed.hostname)
+    global_addresses = [address for address in addresses if address.is_global]
+    if not global_addresses:
+        raise ValueError("Drive Node: source URL must resolve to a globally routable address")
+
+    address = global_addresses[0]
+    request_netloc = _format_host_for_url(address)
+    if port is not None:
+        request_netloc = f"{request_netloc}:{port}"
+    request_url = parsed._replace(netloc=request_netloc).geturl()
+
+    hostname = parsed.hostname
+    sni_hostname = hostname.encode("idna").decode("ascii") if parsed.scheme == "https" else None
+    return _DriveDownloadTarget(
+        original_url=raw_url,
+        request_url=request_url,
+        host_header=_format_host_header(hostname, parsed.scheme, port),
+        sni_hostname=sni_hostname,
+    )
+
+
+def _fetch_drive_download_url(source_url: str) -> httpx.Response:
+    current_url = source_url
+    for _ in range(_DRIVE_DOWNLOAD_MAX_REDIRECTS + 1):
+        target = _resolve_drive_download_target(current_url)
+        headers = {"Host": target.host_header}
+        extensions = {"sni_hostname": target.sni_hostname} if target.sni_hostname else None
+
+        with httpx.Client(timeout=30, follow_redirects=False, trust_env=False) as client:
+            response = client.get(target.request_url, headers=headers, extensions=extensions)
+            if response.status_code not in _DRIVE_DOWNLOAD_REDIRECT_STATUS_CODES:
+                response.raise_for_status()
+                return response
+
+            location = response.headers.get("location")
+            if not location:
+                response.raise_for_status()
+                return response
+            current_url = urljoin(target.original_url, location)
+
+    raise ValueError("Drive Node: too many redirects while downloading URL")
 
 
 def _ensure_additional_properties(schema: dict) -> dict:
@@ -1153,6 +1269,49 @@ class NodeResult:
     metadata: dict = field(default_factory=dict)
 
 
+def _annotate_node_span(span: object, result: "NodeResult") -> None:
+    """Attach status, timing, and (best-effort) LLM token attributes to a node span."""
+    try:
+        from opentelemetry.trace import Status, StatusCode
+
+        span.set_attribute("heym.node.status", result.status)  # type: ignore[attr-defined]
+        span.set_attribute(  # type: ignore[attr-defined]
+            "heym.node.duration_ms", float(result.execution_time_ms)
+        )
+        usage = result.output.get("usage") if isinstance(result.output, dict) else None
+        if isinstance(usage, dict):
+            for src_key, attr in (
+                ("prompt_tokens", "heym.llm.prompt_tokens"),
+                ("completion_tokens", "heym.llm.completion_tokens"),
+                ("total_tokens", "heym.llm.total_tokens"),
+            ):
+                value = usage.get(src_key)
+                if isinstance(value, (int, float)):
+                    span.set_attribute(attr, int(value))  # type: ignore[attr-defined]
+        model = result.output.get("model") if isinstance(result.output, dict) else None
+        if isinstance(model, str) and model:
+            span.set_attribute("heym.llm.model", model)  # type: ignore[attr-defined]
+        if result.status == "error":
+            span.set_status(Status(StatusCode.ERROR, result.error or "node error"))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - observability must never break execution
+        pass
+
+
+def _attach_node_io(span: object, inputs: object, output: object, limit: int = 4096) -> None:
+    """Attach truncated node input/output JSON to a node span (opt-in, privacy-gated)."""
+    try:
+        for attr, value in (("heym.node.input", inputs), ("heym.node.output", output)):
+            try:
+                text = json.dumps(value, default=str, ensure_ascii=False)
+            except Exception:  # noqa: BLE001
+                text = str(value)
+            if len(text) > limit:
+                text = text[:limit] + "...(truncated)"
+            span.set_attribute(attr, text)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - observability must never break execution
+        pass
+
+
 @dataclass
 class SubWorkflowExecution:
     workflow_id: str
@@ -1366,6 +1525,65 @@ def _restore_sub_workflow_executions(executions: list[dict] | None) -> list[SubW
     return restored
 
 
+def _detect_pandoc_format(mime_type: str, filename: str) -> str | None:
+    """Return pandoc input format string for the given MIME type / filename, or None if unsupported."""
+    _mime_map: dict[str, str] = {
+        "text/markdown": "markdown",
+        "text/html": "html",
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+        "text/plain": "markdown",
+        "text/csv": "csv",
+    }
+    if mime_type in _mime_map:
+        return _mime_map[mime_type]
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    _ext_map: dict[str, str] = {
+        "md": "markdown",
+        "markdown": "markdown",
+        "html": "html",
+        "htm": "html",
+        "docx": "docx",
+        "txt": "markdown",
+        "csv": "csv",
+    }
+    return _ext_map.get(ext)
+
+
+def _extract_pdf_text(src_bytes: bytes) -> str:
+    """Extract plain text from a PDF via pypdf."""
+    import io
+
+    import pypdf
+
+    reader = pypdf.PdfReader(io.BytesIO(src_bytes))
+    parts = [page.extract_text() for page in reader.pages if page.extract_text()]
+    return "\n\n".join(parts)
+
+
+def _convert_image(src_bytes: bytes, target_format: str) -> tuple[bytes, str]:
+    """Convert image bytes to target_format. Returns (output_bytes, output_mime_type)."""
+    import io
+
+    from PIL import Image
+
+    _fmt_map: dict[str, tuple[str, str]] = {
+        "jpg": ("JPEG", "image/jpeg"),
+        "jpeg": ("JPEG", "image/jpeg"),
+        "png": ("PNG", "image/png"),
+        "bmp": ("BMP", "image/bmp"),
+        "webp": ("WEBP", "image/webp"),
+    }
+    if target_format not in _fmt_map:
+        raise ValueError(f"Drive Node: unsupported image output format '{target_format}'")
+    pil_format, mime_type = _fmt_map[target_format]
+    img = Image.open(io.BytesIO(src_bytes))
+    if pil_format == "JPEG" and img.mode in ("RGBA", "LA", "P"):
+        img = img.convert("RGB")
+    buf = io.BytesIO()
+    img.save(buf, format=pil_format)
+    return buf.getvalue(), mime_type
+
+
 class WorkflowExecutor:
     def __init__(
         self,
@@ -1377,6 +1595,7 @@ class WorkflowExecutor:
         global_variables_context: dict[str, object] | None = None,
         workflow_id: uuid.UUID | None = None,
         trace_user_id: uuid.UUID | None = None,
+        actor_user_id: uuid.UUID | None = None,
         conversation_history: list[dict[str, str]] | None = None,
         agent_progress_queue: queue.Queue | None = None,
         sub_workflow_invocation_depth: int = 0,
@@ -1404,6 +1623,7 @@ class WorkflowExecutor:
         self.global_variables_context = global_variables_context or {}
         self.workflow_id = workflow_id
         self.trace_user_id = trace_user_id
+        self.actor_user_id = actor_user_id
         self.conversation_history = conversation_history
         self._sub_workflow_invocation_depth = sub_workflow_invocation_depth
         # True when this executor is running a workflow that was invoked (directly or
@@ -1431,6 +1651,9 @@ class WorkflowExecutor:
         self._bg_futures: list = []
         self._bg_futures_lock = Lock()
         self.configured_timezone = configured_timezone or get_configured_timezone()
+        # Active OTel context (with the workflow root span) captured during execute();
+        # re-attached inside worker threads so node spans nest under the workflow span.
+        self._otel_root_context: object | None = None
 
         for edge in self.edges:
             source = edge.get("source")
@@ -1460,6 +1683,152 @@ class WorkflowExecutor:
                 has_input = any(edge["target"] == node_id for edge in self.edges)
                 if not has_input:
                     self.skipped_nodes.add(node_id)
+
+    def _get_accessible_credential(self, db, credential_id: object):
+        from app.db.models import Credential, CredentialShare, CredentialTeamShare, TeamMember
+
+        actor_user_id = self._require_actor_user_id("Credential")
+
+        credential = (
+            db.query(Credential)
+            .filter(
+                Credential.id == credential_id,
+                Credential.owner_id == actor_user_id,
+            )
+            .first()
+        )
+        if credential is not None:
+            return credential
+
+        credential = (
+            db.query(Credential)
+            .join(CredentialShare, CredentialShare.credential_id == Credential.id)
+            .filter(
+                Credential.id == credential_id,
+                CredentialShare.user_id == actor_user_id,
+            )
+            .first()
+        )
+        if credential is not None:
+            return credential
+
+        return (
+            db.query(Credential)
+            .join(CredentialTeamShare, CredentialTeamShare.credential_id == Credential.id)
+            .join(TeamMember, TeamMember.team_id == CredentialTeamShare.team_id)
+            .filter(
+                Credential.id == credential_id,
+                TeamMember.user_id == actor_user_id,
+            )
+            .first()
+        )
+
+    def _get_vector_store_backing_credential(self, db, credential_id: object):
+        from app.db.models import Credential
+
+        return db.query(Credential).filter(Credential.id == credential_id).first()
+
+    def _get_accessible_vector_store(self, db, vector_store_id: object):
+        from app.db.models import (
+            TeamMember,
+            VectorStore,
+            VectorStoreShare,
+            VectorStoreTeamShare,
+        )
+
+        actor_user_id = self._require_actor_user_id("Vector store")
+
+        store = (
+            db.query(VectorStore)
+            .filter(
+                VectorStore.id == vector_store_id,
+                VectorStore.owner_id == actor_user_id,
+            )
+            .first()
+        )
+        if store is not None:
+            return store
+
+        store = (
+            db.query(VectorStore)
+            .join(VectorStoreShare, VectorStoreShare.vector_store_id == VectorStore.id)
+            .filter(
+                VectorStore.id == vector_store_id,
+                VectorStoreShare.user_id == actor_user_id,
+            )
+            .first()
+        )
+        if store is not None:
+            return store
+
+        return (
+            db.query(VectorStore)
+            .join(VectorStoreTeamShare, VectorStoreTeamShare.vector_store_id == VectorStore.id)
+            .join(TeamMember, TeamMember.team_id == VectorStoreTeamShare.team_id)
+            .filter(
+                VectorStore.id == vector_store_id,
+                TeamMember.user_id == actor_user_id,
+            )
+            .first()
+        )
+
+    def _get_accessible_data_table(self, db, data_table_id: object, operation: str):
+        from app.db.models import DataTable, DataTableShare, DataTableTeamShare, TeamMember
+
+        write_required = operation not in ("find", "getAll", "getById")
+        actor_user_id = self._require_actor_user_id("DataTable")
+
+        table = (
+            db.query(DataTable)
+            .filter(
+                DataTable.id == data_table_id,
+                DataTable.owner_id == actor_user_id,
+            )
+            .first()
+        )
+        if table is not None:
+            return table
+
+        has_read_share = False
+        user_shares = (
+            db.query(DataTable, DataTableShare.permission)
+            .join(DataTableShare, DataTableShare.table_id == DataTable.id)
+            .filter(
+                DataTable.id == data_table_id,
+                DataTableShare.user_id == actor_user_id,
+            )
+            .all()
+        )
+        for table, permission in user_shares:
+            has_read_share = True
+            if not write_required or permission == "write":
+                return table
+
+        team_shares = (
+            db.query(DataTable, DataTableTeamShare.permission)
+            .join(DataTableTeamShare, DataTableTeamShare.table_id == DataTable.id)
+            .join(TeamMember, TeamMember.team_id == DataTableTeamShare.team_id)
+            .filter(
+                DataTable.id == data_table_id,
+                TeamMember.user_id == actor_user_id,
+            )
+            .all()
+        )
+        for table, permission in team_shares:
+            has_read_share = True
+            if not write_required or permission == "write":
+                return table
+
+        if has_read_share and write_required:
+            raise ValueError("Write access required for this operation")
+        return None
+
+    def _require_actor_user_id(self, resource_label: str) -> uuid.UUID:
+        if self.actor_user_id is None:
+            raise ValueError(
+                f"{resource_label} lookup requires actor_user_id; refusing unrestricted lookup."
+            )
+        return self.actor_user_id
 
     def get_node_label(self, node_id: str) -> str:
         node = self.nodes.get(node_id)
@@ -2032,6 +2401,7 @@ class WorkflowExecutor:
     ) -> dict:
         return {
             "workflow_id": str(self.workflow_id) if self.workflow_id else None,
+            "actor_user_id": str(self.actor_user_id) if self.actor_user_id else None,
             "nodes": copy.deepcopy(list(self.nodes.values())),
             "edges": copy.deepcopy(self.edges),
             "workflow_cache": copy.deepcopy(self.workflow_cache),
@@ -2066,6 +2436,7 @@ class WorkflowExecutor:
     def build_notification_snapshot(self) -> dict[str, Any]:
         return {
             "workflow_id": str(self.workflow_id) if self.workflow_id else None,
+            "actor_user_id": str(self.actor_user_id) if self.actor_user_id else None,
             "nodes": copy.deepcopy(list(self.nodes.values())),
             "edges": copy.deepcopy(self.edges),
             "workflow_cache": copy.deepcopy(self.workflow_cache),
@@ -2405,6 +2776,7 @@ class WorkflowExecutor:
         batch_mode_enabled: bool = False,
         on_batch_status_update: Callable[[dict[str, Any]], None] | None = None,
         should_abort: Callable[[], str | None] | None = None,
+        request_timeout: float = 60.0,
     ) -> dict:
         if not credential_id or not model:
             return {
@@ -2417,7 +2789,6 @@ class WorkflowExecutor:
         if fallback_credential_id and fallback_model:
             attempts.append((fallback_credential_id, fallback_model))
 
-        from app.db.models import Credential
         from app.db.session import SessionLocal
         from app.services.encryption import decrypt_config
 
@@ -2459,16 +2830,12 @@ class WorkflowExecutor:
 
             try:
                 with SessionLocal() as db:
-                    guardrail_cred = (
-                        db.query(Credential)
-                        .filter(Credential.id == guardrail_credential_id)
-                        .first()
-                    )
+                    guardrail_cred = self._get_accessible_credential(db, guardrail_credential_id)
                     if not guardrail_cred:
                         return {
                             "text": "",
                             "model": model,
-                            "error": "Guardrail credential not found.",
+                            "error": "Guardrail credential not found or not accessible.",
                         }
                     guardrail_credential_type = guardrail_cred.type
                     gcred_cfg = decrypt_config(guardrail_cred.encrypted_config)
@@ -2586,7 +2953,7 @@ class WorkflowExecutor:
             base_url = None
             try:
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == cid).first()
+                    cred = self._get_accessible_credential(db, cid)
                     if cred:
                         credential_type = cred.type
                         config = decrypt_config(cred.encrypted_config)
@@ -2677,6 +3044,7 @@ class WorkflowExecutor:
                             conversation_history=self.conversation_history,
                             on_status_update=on_batch_status_update,
                             should_abort=should_abort,
+                            request_timeout=request_timeout,
                         )
                     )
                 else:
@@ -2697,6 +3065,7 @@ class WorkflowExecutor:
                             image_input=image_input,
                             trace_context=trace_context,
                             conversation_history=self.conversation_history,
+                            request_timeout=request_timeout,
                         )
                     )
                 out = dict(result)
@@ -2966,6 +3335,7 @@ class WorkflowExecutor:
             global_variables_context=merged_global,
             workflow_id=uuid.UUID(workflow_id_str),
             trace_user_id=self.trace_user_id,
+            actor_user_id=self.actor_user_id,
             sub_workflow_invocation_depth=self._sub_workflow_invocation_depth + 1,
             cancel_event=sub_cancel_event,
             invoked_by_agent=True,
@@ -3760,6 +4130,7 @@ class WorkflowExecutor:
         max_tokens = node_data.get("maxTokens")
         tools = node_data.get("tools") or []
         tool_timeout_seconds = float(node_data.get("toolTimeoutSeconds") or 30)
+        request_timeout_seconds = float(node_data.get("requestTimeoutSeconds") or 60)
         max_tool_iterations = int(node_data.get("maxToolIterations") or 30)
         image_input_enabled = bool(node_data.get("imageInputEnabled", False))
         image_input_template = node_data.get("imageInput", "")
@@ -3950,7 +4321,6 @@ class WorkflowExecutor:
         if fallback_credential_id and fallback_model:
             attempts.append((fallback_credential_id, fallback_model))
 
-        from app.db.models import Credential
         from app.db.session import SessionLocal
         from app.services.encryption import decrypt_config
         from app.services.llm_service import execute_llm, execute_llm_with_tools
@@ -3991,16 +4361,12 @@ class WorkflowExecutor:
 
             try:
                 with SessionLocal() as db:
-                    guardrail_cred = (
-                        db.query(Credential)
-                        .filter(Credential.id == guardrail_credential_id)
-                        .first()
-                    )
+                    guardrail_cred = self._get_accessible_credential(db, guardrail_credential_id)
                     if not guardrail_cred:
                         return {
                             "text": "",
                             "model": model,
-                            "error": "Guardrail credential not found.",
+                            "error": "Guardrail credential not found or not accessible.",
                         }
                     guardrail_credential_type = guardrail_cred.type
                     gcred_cfg = decrypt_config(guardrail_cred.encrypted_config)
@@ -4310,7 +4676,7 @@ class WorkflowExecutor:
             base_url = None
             try:
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == cid).first()
+                    cred = self._get_accessible_credential(db, cid)
                     if cred:
                         credential_type = cred.type
                         config = decrypt_config(cred.encrypted_config)
@@ -4400,6 +4766,7 @@ class WorkflowExecutor:
                             initial_prompt_tokens=resume_prompt_tokens,
                             initial_completion_tokens=resume_completion_tokens,
                             should_abort=should_abort_tool_loop,
+                            request_timeout=request_timeout_seconds,
                         )
                     )
                 else:
@@ -4419,6 +4786,7 @@ class WorkflowExecutor:
                             trace_context=trace_context,
                             conversation_history=conversation_history,
                             skills_included=skills_used or None,
+                            request_timeout=request_timeout_seconds,
                         )
                     )
             except Exception as e:
@@ -5983,6 +6351,40 @@ class WorkflowExecutor:
         allow_branch_skip: bool = True,
         on_retry: Callable[[NodeResult, int, int], None] | None = None,
     ) -> NodeResult:
+        """Public entry: wrap node execution in an OTel span (no-op when disabled)."""
+        if not tracing.is_enabled():
+            return self._execute_node_inner(node_id, inputs, allow_branch_skip, on_retry)
+
+        def _run() -> NodeResult:
+            tracer = tracing.get_tracer()
+            node = self.nodes.get(node_id, {})
+            node_data = node.get("data", {}) if isinstance(node, dict) else {}
+            with tracer.start_as_current_span("heym.node.execute") as span:
+                span.set_attribute("heym.node.id", str(node_id))
+                span.set_attribute("heym.node.type", node.get("type", "unknown"))
+                span.set_attribute("heym.node.label", node_data.get("label", node_id))
+                if self.workflow_id is not None:
+                    span.set_attribute("heym.workflow.id", str(self.workflow_id))
+                result = self._execute_node_inner(node_id, inputs, allow_branch_skip, on_retry)
+                _annotate_node_span(span, result)
+                if tracing.capture_node_io_enabled():
+                    _attach_node_io(span, inputs, result.output)
+                return result
+
+        # Re-attach the workflow root context so node spans nest under the workflow
+        # span even when this runs inside a ThreadPoolExecutor worker thread.
+        root_ctx = getattr(self, "_otel_root_context", None)
+        if root_ctx is not None:
+            return tracing.run_with_context(root_ctx, _run)
+        return _run()
+
+    def _execute_node_inner(
+        self,
+        node_id: str,
+        inputs: dict,
+        allow_branch_skip: bool = True,
+        on_retry: Callable[[NodeResult, int, int], None] | None = None,
+    ) -> NodeResult:
         start_time = time.time()
         self.check_cancelled()
         node = self.nodes[node_id]
@@ -6323,6 +6725,7 @@ class WorkflowExecutor:
                     batch_mode_enabled=batch_mode_enabled,
                     on_batch_status_update=batch_status_callback if batch_mode_enabled else None,
                     should_abort=batch_should_abort if batch_mode_enabled else None,
+                    request_timeout=float(node_data.get("requestTimeoutSeconds") or 60),
                 )
                 trace_id = self._pop_internal_trace_id(output)
                 if output.get("error"):
@@ -6600,6 +7003,7 @@ class WorkflowExecutor:
                         global_variables_context=merged_global,
                         workflow_id=uuid.UUID(execute_workflow_id),
                         trace_user_id=self.trace_user_id,
+                        actor_user_id=self.actor_user_id,
                         sub_workflow_invocation_depth=self._sub_workflow_invocation_depth + 1,
                         cancel_event=_exec_node_cancel_event,
                         invoked_by_agent=self._invoked_by_agent,
@@ -6797,13 +7201,12 @@ class WorkflowExecutor:
                 if not credential_id:
                     raise ValueError("Slack node requires a credential")
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 webhook_url = ""
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         config = decrypt_config(cred.encrypted_config)
                         webhook_url = config.get("webhook_url", "")
@@ -6838,13 +7241,12 @@ class WorkflowExecutor:
                 if chat_id in (None, ""):
                     raise ValueError("Telegram node requires chatId")
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 telegram_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         telegram_config = decrypt_config(cred.encrypted_config)
 
@@ -6892,13 +7294,12 @@ class WorkflowExecutor:
                 if not credential_id:
                     raise ValueError("Send Email node requires an SMTP credential")
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 smtp_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         smtp_config = decrypt_config(cred.encrypted_config)
 
@@ -6977,13 +7378,12 @@ class WorkflowExecutor:
 
                 redis_key = self.evaluate_message_template(key_template, inputs, node_id)
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 redis_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         redis_config = decrypt_config(cred.encrypted_config)
 
@@ -7392,7 +7792,6 @@ class WorkflowExecutor:
                 output = {"note": node_data.get("note", "")}
 
             elif node_type == "rag":
-                from app.db.models import Credential, VectorStore
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
                 from app.services.vector_store import create_vector_store_service
@@ -7408,11 +7807,11 @@ class WorkflowExecutor:
                 qdrant_config: dict = {}
                 collection_name: str = ""
                 with SessionLocal() as db:
-                    store = db.query(VectorStore).filter(VectorStore.id == vector_store_id).first()
+                    store = self._get_accessible_vector_store(db, vector_store_id)
                     if not store:
-                        raise ValueError("Vector store not found")
+                        raise ValueError("Vector store not found or not accessible")
                     collection_name = store.collection_name
-                    cred = db.query(Credential).filter(Credential.id == store.credential_id).first()
+                    cred = self._get_vector_store_backing_credential(db, store.credential_id)
                     if cred:
                         qdrant_config = decrypt_config(cred.encrypted_config)
 
@@ -7486,10 +7885,8 @@ class WorkflowExecutor:
 
                         cohere_config: dict = {}
                         with SessionLocal() as db:
-                            reranker_cred = (
-                                db.query(Credential)
-                                .filter(Credential.id == reranker_credential_id)
-                                .first()
+                            reranker_cred = self._get_accessible_credential(
+                                db, reranker_credential_id
                             )
                             if reranker_cred:
                                 cohere_config = decrypt_config(reranker_cred.encrypted_config)
@@ -7562,13 +7959,12 @@ class WorkflowExecutor:
                 if not operation:
                     raise ValueError("Grist node requires an operation")
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 grist_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         grist_config = decrypt_config(cred.encrypted_config)
 
@@ -7863,7 +8259,6 @@ class WorkflowExecutor:
             elif node_type == "googleSheets":
                 import json as _json
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
                 from app.services.google_sheets_service import GoogleSheetsService
@@ -7874,7 +8269,7 @@ class WorkflowExecutor:
 
                 gs_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         gs_config = decrypt_config(cred.encrypted_config)
 
@@ -7959,7 +8354,6 @@ class WorkflowExecutor:
             elif node_type == "bigquery":
                 import json as _json
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.bigquery_service import BigQueryService
                 from app.services.encryption import decrypt_config
@@ -7970,7 +8364,7 @@ class WorkflowExecutor:
 
                 bq_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         bq_config = decrypt_config(cred.encrypted_config)
 
@@ -8042,13 +8436,12 @@ class WorkflowExecutor:
                 if not credential_id:
                     raise ValueError("RabbitMQ node requires a credential")
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 rabbitmq_config: dict = {}
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         rabbitmq_config = decrypt_config(cred.encrypted_config)
 
@@ -8134,13 +8527,12 @@ class WorkflowExecutor:
                 if not credential_id:
                     raise ValueError("Crawler node requires a FlareSolverr credential")
 
-                from app.db.models import Credential
                 from app.db.session import SessionLocal
                 from app.services.encryption import decrypt_config
 
                 flaresolverr_url = ""
                 with SessionLocal() as db:
-                    cred = db.query(Credential).filter(Credential.id == credential_id).first()
+                    cred = self._get_accessible_credential(db, credential_id)
                     if cred:
                         config = decrypt_config(cred.encrypted_config)
                         flaresolverr_url = config.get("flaresolverr_url", "")
@@ -8243,17 +8635,14 @@ class WorkflowExecutor:
                 )
                 first_input = next(iter(inputs.values()), {})
                 output = first_input if isinstance(first_input, dict) else {"value": first_input}
+                output = dict(output)
+                output["logMessage"] = self._unwrap_value(resolved)
 
             elif node_type == "playwright":
                 output = self._execute_playwright_node(node_data, inputs, node_id, node_label)
 
             elif node_type == "dataTable":
-                from app.db.models import (
-                    DataTable,
-                    DataTableRow,
-                    DataTableShare,
-                    DataTableTeamShare,
-                )
+                from app.db.models import DataTableRow
                 from app.db.session import SessionLocal
 
                 data_table_id = node_data.get("dataTableId")
@@ -8265,45 +8654,12 @@ class WorkflowExecutor:
                     raise ValueError("DataTable node requires an operation")
 
                 with SessionLocal() as db:
-                    # Check access
-                    table = db.query(DataTable).filter(DataTable.id == data_table_id).first()
+                    table = self._get_accessible_data_table(db, data_table_id, operation)
                     if not table:
-                        raise ValueError(f"DataTable not found: {data_table_id}")
+                        raise ValueError(f"DataTable not found or not accessible: {data_table_id}")
 
-                    owner_id = (
-                        self.workflow_owner_id if hasattr(self, "workflow_owner_id") else None
-                    )
-                    if owner_id and str(table.owner_id) != str(owner_id):
-                        user_share = (
-                            db.query(DataTableShare)
-                            .filter(
-                                DataTableShare.table_id == data_table_id,
-                                DataTableShare.user_id == owner_id,
-                            )
-                            .first()
-                        )
-                        if not user_share:
-                            team_share = (
-                                db.query(DataTableTeamShare)
-                                .filter(
-                                    DataTableTeamShare.table_id == data_table_id,
-                                )
-                                .first()
-                            )
-                            if not team_share:
-                                raise ValueError("No access to this DataTable")
-                            if (
-                                operation not in ("find", "getAll", "getById")
-                                and team_share.permission != "write"
-                            ):
-                                raise ValueError("Write access required for this operation")
-                        elif (
-                            operation not in ("find", "getAll", "getById")
-                            and user_share.permission != "write"
-                        ):
-                            raise ValueError("Write access required for this operation")
-
-                        columns = table.columns or []
+                    owner_id = self.actor_user_id
+                    columns = table.columns or []
 
                     def _coerce_output(data: dict, cols: list) -> dict:
                         """Coerce stored row data to proper types on read."""
@@ -8675,7 +9031,12 @@ class WorkflowExecutor:
 
                 from app.db.models import FileAccessToken, GeneratedFile
                 from app.db.session import SessionLocal
-                from app.services.file_storage import _storage_root, build_download_url
+                from app.services.file_storage import (
+                    _normalize_storage_filename,
+                    _safe_storage_path,
+                    _storage_root,
+                    build_download_url,
+                )
 
                 operation = node_data.get("driveOperation", "")
                 if not operation:
@@ -8710,9 +9071,7 @@ class WorkflowExecutor:
                         raise ValueError("Drive Node: source URL is required for downloadUrl")
 
                     try:
-                        with httpx.Client(timeout=30, follow_redirects=True) as _client:
-                            _resp = _client.get(source_url)
-                            _resp.raise_for_status()
+                        _resp = _fetch_drive_download_url(source_url)
                         file_bytes = _resp.content
                         content_type = _resp.headers.get("content-type", "application/octet-stream")
                         mime_type = content_type.split(";")[0].strip()
@@ -8730,6 +9089,7 @@ class WorkflowExecutor:
                             filename = _url_path.split("/")[-1] if _url_path else ""
                         if not filename:
                             filename = "downloaded_file"
+                        filename = _normalize_storage_filename(filename)
                         if not mime_type or mime_type == "application/octet-stream":
                             _guessed = _mimetypes.guess_type(filename)[0]
                             if _guessed:
@@ -8750,7 +9110,7 @@ class WorkflowExecutor:
                     with SessionLocal() as db:
                         _file_uuid = uuid.uuid4()
                         _rel_path = f"{owner_id}/{_file_uuid}/{filename}"
-                        _abs_path = _storage_root() / _rel_path
+                        _abs_path = _safe_storage_path(_rel_path)
                         _abs_path.parent.mkdir(parents=True, exist_ok=True)
                         _abs_path.write_bytes(file_bytes)
 
@@ -8995,6 +9355,262 @@ class WorkflowExecutor:
                                 file_bytes = disk_path.read_bytes()
                                 output["file_base64"] = _base64.b64encode(file_bytes).decode()
 
+                        elif operation == "convertFile":
+                            import tempfile as _tempfile
+
+                            import pypandoc as _pypandoc
+
+                            from app.config import settings as _settings
+
+                            target_format = node_data.get("driveConvertTargetFormat", "")
+                            if not target_format:
+                                raise ValueError(
+                                    "Drive Node: targetFormat is required for convertFile"
+                                )
+
+                            _image_formats = {"jpg", "jpeg", "png", "bmp", "webp"}
+                            _doc_formats = {"pdf", "docx", "html", "md", "txt", "csv", "epub"}
+
+                            src_mime = file_row.mime_type or ""
+                            src_filename = file_row.filename or ""
+                            _image_mimes = {
+                                "image/jpeg",
+                                "image/jpg",
+                                "image/png",
+                                "image/bmp",
+                                "image/webp",
+                            }
+                            is_image_input = src_mime in _image_mimes
+
+                            if is_image_input and target_format in _doc_formats:
+                                raise ValueError(
+                                    f"Drive Node: cannot convert image to '{target_format}' — "
+                                    f"choose an image output format (jpg, png, bmp, webp)"
+                                )
+                            if not is_image_input and target_format in _image_formats:
+                                raise ValueError(
+                                    f"Drive Node: cannot convert document to '{target_format}' — "
+                                    f"choose a document output format (pdf, docx, html, md, txt)"
+                                )
+
+                            disk_path = _storage_root() / file_row.storage_path
+                            if not disk_path.exists():
+                                raise ValueError(
+                                    f"Drive Node: source file not found on disk: {src_filename}"
+                                )
+                            src_bytes = disk_path.read_bytes()
+
+                            if is_image_input:
+                                try:
+                                    out_bytes, out_mime = _convert_image(src_bytes, target_format)
+                                except Exception as exc:
+                                    raise ValueError(
+                                        f"Drive Node: conversion failed: {exc}"
+                                    ) from exc
+                                norm_ext = (
+                                    "jpg" if target_format in ("jpg", "jpeg") else target_format
+                                )
+                                base_name = (
+                                    src_filename.rsplit(".", 1)[0]
+                                    if "." in src_filename
+                                    else src_filename
+                                )
+                                out_filename = f"{base_name}.{norm_ext}"
+                            else:
+                                _special_inputs = {"application/pdf", "application/json"}
+                                pandoc_fmt = _detect_pandoc_format(src_mime, src_filename)
+                                if pandoc_fmt is None and src_mime not in _special_inputs:
+                                    raise ValueError(
+                                        f"Drive Node: convertFile does not support input format '{src_mime}'"
+                                    )
+                                _all_doc_formats = {
+                                    "pdf",
+                                    "docx",
+                                    "html",
+                                    "md",
+                                    "txt",
+                                    "csv",
+                                    "epub",
+                                }
+                                if target_format not in _all_doc_formats:
+                                    raise ValueError(
+                                        f"Drive Node: convertFile does not support output format '{target_format}'"
+                                    )
+                                base_name = (
+                                    src_filename.rsplit(".", 1)[0]
+                                    if "." in src_filename
+                                    else src_filename
+                                )
+
+                                # CSV output: Python-native (pandoc has no csv output format)
+                                if target_format == "csv":
+                                    import csv as _csv_mod
+                                    import io as _io_mod
+                                    import json as _json
+
+                                    if src_mime != "application/json":
+                                        raise ValueError(
+                                            "Drive Node: CSV output is only supported for JSON array input"
+                                        )
+                                    try:
+                                        _raw = src_bytes.decode("utf-8", errors="replace")
+                                        _data = _json.loads(_raw)
+                                        if (
+                                            not isinstance(_data, list)
+                                            or not _data
+                                            or not isinstance(_data[0], dict)
+                                        ):
+                                            raise ValueError(
+                                                "JSON must be an array of objects for CSV conversion"
+                                            )
+                                        _buf = _io_mod.StringIO()
+                                        _writer = _csv_mod.DictWriter(
+                                            _buf,
+                                            fieldnames=list(_data[0].keys()),
+                                            extrasaction="ignore",
+                                        )
+                                        _writer.writeheader()
+                                        _writer.writerows(_data)
+                                        out_bytes = _buf.getvalue().encode("utf-8")
+                                    except Exception as exc:
+                                        raise ValueError(
+                                            f"Drive Node: conversion failed: {exc}"
+                                        ) from exc
+                                    out_filename = f"{base_name}.csv"
+                                    out_mime = "text/csv"
+                                else:
+                                    # Pandoc path for all other document output formats
+                                    _format_to_ext = {
+                                        "pdf": "pdf",
+                                        "docx": "docx",
+                                        "html": "html",
+                                        "md": "md",
+                                        "txt": "txt",
+                                        "epub": "epub",
+                                    }
+                                    _format_to_mime = {
+                                        "pdf": "application/pdf",
+                                        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                        "html": "text/html",
+                                        "md": "text/markdown",
+                                        "txt": "text/plain",
+                                        "epub": "application/epub+zip",
+                                    }
+                                    _pandoc_target = {
+                                        "pdf": "pdf",
+                                        "docx": "docx",
+                                        "html": "html",
+                                        "md": "markdown",
+                                        "txt": "plain",
+                                        "epub": "epub",
+                                    }
+                                    out_ext = _format_to_ext[target_format]
+                                    out_filename = f"{base_name}.{out_ext}"
+                                    out_mime = _format_to_mime[target_format]
+                                    try:
+                                        with _tempfile.TemporaryDirectory() as tmpdir:
+                                            if src_mime == "application/pdf":
+                                                extracted = _extract_pdf_text(src_bytes)
+                                                src_tmp = f"{tmpdir}/input.txt"
+                                                with open(src_tmp, "w", encoding="utf-8") as fh:
+                                                    fh.write(extracted)
+                                                pandoc_fmt = "markdown"
+                                            elif src_mime == "application/json":
+                                                import json as _json
+
+                                                _raw = src_bytes.decode("utf-8", errors="replace")
+                                                try:
+                                                    _data = _json.loads(_raw)
+                                                    _pretty = _json.dumps(
+                                                        _data, indent=2, ensure_ascii=False
+                                                    )
+                                                except _json.JSONDecodeError:
+                                                    _pretty = _raw
+                                                src_tmp = f"{tmpdir}/input.md"
+                                                with open(src_tmp, "w", encoding="utf-8") as fh:
+                                                    fh.write(f"```json\n{_pretty}\n```\n")
+                                                pandoc_fmt = "markdown"
+                                            else:
+                                                src_ext = (
+                                                    src_filename.rsplit(".", 1)[-1]
+                                                    if "." in src_filename
+                                                    else "txt"
+                                                )
+                                                src_tmp = f"{tmpdir}/input.{src_ext}"
+                                                with open(src_tmp, "wb") as fh:
+                                                    fh.write(src_bytes)
+                                            out_tmp = f"{tmpdir}/output.{out_ext}"
+                                            extra_args = (
+                                                ["--pdf-engine=weasyprint"]
+                                                if target_format == "pdf"
+                                                else []
+                                            )
+                                            _pypandoc.convert_file(
+                                                src_tmp,
+                                                _pandoc_target[target_format],
+                                                outputfile=out_tmp,
+                                                format=pandoc_fmt,
+                                                extra_args=extra_args,
+                                            )
+                                            with open(out_tmp, "rb") as fh:
+                                                out_bytes = fh.read()
+                                    except Exception as exc:
+                                        raise ValueError(
+                                            f"Drive Node: conversion failed: {exc}"
+                                        ) from exc
+
+                            _max_bytes = _settings.file_max_size_mb * 1024 * 1024
+                            if len(out_bytes) > _max_bytes:
+                                raise ValueError(
+                                    f"Drive Node: converted file exceeds size limit ({_settings.file_max_size_mb} MB)"
+                                )
+
+                            import secrets as _secrets
+
+                            out_filename = _normalize_storage_filename(out_filename)
+                            new_uuid = uuid.uuid4()
+                            rel_path = f"{owner_id}/{new_uuid}/{out_filename}"
+                            abs_path = _safe_storage_path(rel_path)
+                            abs_path.parent.mkdir(parents=True, exist_ok=True)
+                            abs_path.write_bytes(out_bytes)
+
+                            new_row = GeneratedFile(
+                                id=new_uuid,
+                                owner_id=owner_id,
+                                workflow_id=self.workflow_id,
+                                filename=out_filename,
+                                storage_path=rel_path,
+                                mime_type=out_mime,
+                                size_bytes=len(out_bytes),
+                                source_node_id=node_id,
+                                source_node_label=node_data.get("label"),
+                                metadata_json={},
+                            )
+                            db.add(new_row)
+                            db.flush()
+
+                            token_str = _secrets.token_urlsafe(32)
+                            db.add(
+                                FileAccessToken(
+                                    file_id=new_uuid,
+                                    token=token_str,
+                                    created_by_id=owner_id,
+                                )
+                            )
+                            db.commit()
+
+                            base_url = self._base_url
+                            dl_url = build_download_url(base_url, token_str)
+                            output = {
+                                "status": "success",
+                                "operation": "convertFile",
+                                "id": str(new_uuid),
+                                "filename": out_filename,
+                                "mime_type": out_mime,
+                                "size_bytes": len(out_bytes),
+                                "download_url": dl_url,
+                            }
+
                         elif operation != "getAll":
                             raise ValueError(f"Drive Node: unknown operation '{operation}'")
 
@@ -9187,6 +9803,36 @@ class WorkflowExecutor:
         return results, error_flow_output
 
     def execute(self, workflow_id: uuid.UUID, initial_inputs: dict) -> ExecutionResult:
+        """Public entry: wrap the whole workflow run in an OTel root span."""
+        if not tracing.is_enabled():
+            return self._execute_inner(workflow_id, initial_inputs)
+
+        tracer = tracing.get_tracer()
+        from opentelemetry.trace import Status, StatusCode
+
+        with tracer.start_as_current_span("heym.workflow.execute") as span:
+            span.set_attribute("heym.workflow.id", str(workflow_id))
+            span.set_attribute("heym.node.count", len(self.nodes))
+            span.set_attribute("heym.workflow.test_mode", bool(self.test_mode))
+            span.set_attribute("heym.sub_workflow.depth", int(self._sub_workflow_invocation_depth))
+            # Capture the context (with the root span active) so node spans created in
+            # worker threads can re-attach it and nest correctly.
+            self._otel_root_context = tracing.capture_context()
+            try:
+                result = self._execute_inner(workflow_id, initial_inputs)
+            except Exception as exc:
+                span.record_exception(exc)
+                span.set_status(Status(StatusCode.ERROR, str(exc)))
+                raise
+            finally:
+                self._otel_root_context = None
+            if getattr(result, "status", "") in ("error", "failed"):
+                span.set_status(Status(StatusCode.ERROR, "workflow failed"))
+            else:
+                span.set_attribute("heym.workflow.status", getattr(result, "status", ""))
+            return result
+
+    def _execute_inner(self, workflow_id: uuid.UUID, initial_inputs: dict) -> ExecutionResult:
         start_time = time.time()
         self.check_cancelled()
         node_results: list[NodeResult] = []
@@ -9598,6 +10244,7 @@ def execute_workflow(
     credentials_context: dict[str, str] | None = None,
     global_variables_context: dict[str, object] | None = None,
     trace_user_id: uuid.UUID | None = None,
+    actor_user_id: uuid.UUID | None = None,
     conversation_history: list[dict[str, str]] | None = None,
     cancel_event: Event | None = None,
     public_base_url: str = "",
@@ -9611,6 +10258,7 @@ def execute_workflow(
         global_variables_context=global_variables_context,
         workflow_id=workflow_id,
         trace_user_id=trace_user_id,
+        actor_user_id=actor_user_id,
         conversation_history=conversation_history,
         cancel_event=cancel_event,
         public_base_url=public_base_url,
@@ -9628,6 +10276,18 @@ def execute_workflow(
     return result
 
 
+def _snapshot_actor_user_id(
+    snapshot: dict, explicit_actor_user_id: uuid.UUID | None = None
+) -> uuid.UUID | None:
+    if explicit_actor_user_id is not None:
+        return explicit_actor_user_id
+    for key in ("actor_user_id", "credentials_owner_id"):
+        value = snapshot.get(key)
+        if value:
+            return uuid.UUID(str(value))
+    return None
+
+
 def resume_workflow_execution(
     *,
     snapshot: dict,
@@ -9635,6 +10295,7 @@ def resume_workflow_execution(
     credentials_context: dict[str, str] | None = None,
     global_variables_context: dict[str, object] | None = None,
     trace_user_id: uuid.UUID | None = None,
+    actor_user_id: uuid.UUID | None = None,
 ) -> ExecutionResult:
     workflow_id_value = snapshot.get("workflow_id")
     if not workflow_id_value:
@@ -9650,6 +10311,7 @@ def resume_workflow_execution(
         global_variables_context=global_variables_context,
         workflow_id=workflow_id,
         trace_user_id=trace_user_id,
+        actor_user_id=_snapshot_actor_user_id(snapshot, actor_user_id),
         conversation_history=snapshot.get("conversation_history"),
         sub_workflow_invocation_depth=int(snapshot.get("sub_workflow_invocation_depth", 0)),
         invoked_by_agent=bool(snapshot.get("invoked_by_agent", False)),
@@ -10062,6 +10724,7 @@ def execute_llm_batch_notification_branch(
         global_variables_context=global_variables_context,
         workflow_id=workflow_id,
         trace_user_id=trace_user_id,
+        actor_user_id=_snapshot_actor_user_id(snapshot),
         conversation_history=snapshot.get("conversation_history"),
         agent_progress_queue=agent_progress_queue,
         sub_workflow_invocation_depth=int(snapshot.get("sub_workflow_invocation_depth", 0)),
@@ -10287,6 +10950,7 @@ def execute_hitl_notification_branch(
         global_variables_context=global_variables_context,
         workflow_id=workflow_id,
         trace_user_id=trace_user_id,
+        actor_user_id=_snapshot_actor_user_id(snapshot),
         conversation_history=snapshot.get("conversation_history"),
         sub_workflow_invocation_depth=int(snapshot.get("sub_workflow_invocation_depth", 0)),
         invoked_by_agent=bool(snapshot.get("invoked_by_agent", False)),
@@ -10595,7 +11259,38 @@ def build_node_start_message(
     return config.get("start_message") or f"[START] {node_label}"
 
 
-def execute_workflow_streaming(
+def execute_workflow_streaming(**kwargs):
+    """Public streaming entry: wrap the run in an OTel root span (no-op when disabled).
+
+    The canvas "Run" and portal use the streaming path, which has its own node
+    loop and does not call ``WorkflowExecutor.execute``. This wrapper opens the
+    ``heym.workflow.execute`` root span here so node spans nest under it.
+    """
+    if not tracing.is_enabled():
+        yield from _execute_workflow_streaming_impl(**kwargs)
+        return
+
+    from opentelemetry.trace import Status, StatusCode, set_span_in_context
+
+    tracer = tracing.get_tracer()
+    span = tracer.start_span("heym.workflow.execute")
+    try:
+        span.set_attribute("heym.workflow.id", str(kwargs.get("workflow_id", "")))
+        span.set_attribute("heym.node.count", len(kwargs.get("nodes") or []))
+        span.set_attribute("heym.workflow.test_mode", bool(kwargs.get("test_run", False)))
+        span.set_attribute("heym.execution.mode", "streaming")
+        yield from _execute_workflow_streaming_impl(
+            otel_root_context=set_span_in_context(span), **kwargs
+        )
+    except Exception as exc:  # noqa: BLE001 - observe then re-raise
+        span.record_exception(exc)
+        span.set_status(Status(StatusCode.ERROR, str(exc)))
+        raise
+    finally:
+        span.end()
+
+
+def _execute_workflow_streaming_impl(
     workflow_id: uuid.UUID,
     nodes: list[dict],
     edges: list[dict],
@@ -10605,11 +11300,13 @@ def execute_workflow_streaming(
     credentials_context: dict[str, str] | None = None,
     global_variables_context: dict[str, object] | None = None,
     trace_user_id: uuid.UUID | None = None,
+    actor_user_id: uuid.UUID | None = None,
     conversation_history: list[dict[str, str]] | None = None,
     cancel_event: Event | None = None,
     executor_holder: dict | None = None,
     sse_node_config: dict | None = None,
     public_base_url: str = "",
+    otel_root_context: object | None = None,
 ):
     import queue
 
@@ -10623,6 +11320,7 @@ def execute_workflow_streaming(
         global_variables_context=global_variables_context,
         workflow_id=workflow_id,
         trace_user_id=trace_user_id,
+        actor_user_id=actor_user_id,
         conversation_history=conversation_history,
         agent_progress_queue=event_queue,
         cancel_event=cancel_event,
@@ -10630,6 +11328,10 @@ def execute_workflow_streaming(
     )
     if executor_holder is not None:
         executor_holder["executor"] = wf_executor
+    # Re-attach the streaming root span context so node spans (run in worker
+    # threads via execute_node) nest under heym.workflow.execute.
+    if otel_root_context is not None:
+        wf_executor._otel_root_context = otel_root_context
     start_time = time.time()
     node_results: list[NodeResult] = []
     has_error = False

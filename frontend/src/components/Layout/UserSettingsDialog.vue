@@ -1,15 +1,29 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
+import { useRouter } from "vue-router";
+
+import type { CredentialListItem } from "@/types/credential";
 
 import Button from "@/components/ui/Button.vue";
 import Dialog from "@/components/ui/Dialog.vue";
 import Input from "@/components/ui/Input.vue";
 import Label from "@/components/ui/Label.vue";
+import Select from "@/components/ui/Select.vue";
 import Textarea from "@/components/ui/Textarea.vue";
+import {
+  credentialsApi,
+  observabilityApi,
+  voiceApi,
+  type ObservabilityStatus,
+  type VoiceInfo,
+} from "@/services/api";
 import { useAuthStore } from "@/stores/auth";
+
+type SettingsTab = "profile" | "security" | "voice" | "observability";
 
 const props = defineProps<{
   open: boolean;
+  initialTab?: SettingsTab;
 }>();
 
 const emit = defineEmits<{
@@ -17,14 +31,89 @@ const emit = defineEmits<{
 }>();
 
 const authStore = useAuthStore();
+const router = useRouter();
 
-const activeTab = ref<"profile" | "security">("profile");
+const activeTab = ref<SettingsTab>("profile");
+
+const observabilityStatus = ref<ObservabilityStatus | null>(null);
+const loadingObservability = ref(false);
+
+async function loadObservabilityStatus(): Promise<void> {
+  loadingObservability.value = true;
+  try {
+    observabilityStatus.value = await observabilityApi.getStatus();
+  } catch {
+    observabilityStatus.value = null;
+  } finally {
+    loadingObservability.value = false;
+  }
+}
 
 const savingProfile = ref(false);
 const savingPassword = ref(false);
 
 const name = ref("");
 const userRules = ref("");
+
+const elevenlabsCredentials = ref<CredentialListItem[]>([]);
+const voices = ref<VoiceInfo[]>([]);
+const selectedTtsCredentialId = ref<string>("");
+const selectedVoiceId = ref<string>("");
+const loadingVoices = ref(false);
+const voiceError = ref<string | null>(null);
+const savingVoice = ref(false);
+
+const credentialOptions = computed(() => [
+  { value: "", label: "Select a credential" },
+  ...elevenlabsCredentials.value.map((c) => ({ value: c.id, label: c.name })),
+]);
+const voiceOptions = computed(() => [
+  { value: "", label: "Select a voice" },
+  ...voices.value.map((v) => ({ value: v.voice_id, label: v.name })),
+]);
+
+async function loadElevenLabsCredentials(): Promise<void> {
+  elevenlabsCredentials.value = await credentialsApi.listByType("elevenlabs");
+}
+
+async function loadVoices(): Promise<void> {
+  if (!selectedTtsCredentialId.value) {
+    voices.value = [];
+    return;
+  }
+  loadingVoices.value = true;
+  voiceError.value = null;
+  try {
+    voices.value = await voiceApi.listVoices(selectedTtsCredentialId.value);
+  } catch {
+    voiceError.value = "Could not load voices. Check the credential.";
+    voices.value = [];
+  } finally {
+    loadingVoices.value = false;
+  }
+}
+
+watch(selectedTtsCredentialId, () => {
+  void loadVoices();
+});
+
+function goToCredentialsTab(): void {
+  emit("close");
+  void router.push({ name: "dashboard", query: { tab: "credentials" } });
+}
+
+async function handleSaveVoice(): Promise<void> {
+  savingVoice.value = true;
+  try {
+    await authStore.updateUser({
+      tts_credential_id: selectedTtsCredentialId.value || null,
+      tts_voice_id: selectedVoiceId.value || null,
+    });
+    emit("close");
+  } finally {
+    savingVoice.value = false;
+  }
+}
 
 const currentPassword = ref("");
 const newPassword = ref("");
@@ -38,16 +127,28 @@ watch(
     if (isOpen && authStore.user) {
       name.value = authStore.user.name;
       userRules.value = authStore.user.user_rules || "";
-      activeTab.value = "profile";
+      activeTab.value = props.initialTab ?? "profile";
       currentPassword.value = "";
       newPassword.value = "";
       confirmNewPassword.value = "";
       passwordError.value = null;
       passwordSuccess.value = null;
+      selectedTtsCredentialId.value = authStore.user.tts_credential_id ?? "";
+      selectedVoiceId.value = authStore.user.tts_voice_id ?? "";
+      void loadElevenLabsCredentials().then(loadVoices);
+      if (activeTab.value === "observability") {
+        void loadObservabilityStatus();
+      }
     }
   },
   { immediate: true },
 );
+
+watch(activeTab, (tab) => {
+  if (tab === "observability" && observabilityStatus.value === null) {
+    void loadObservabilityStatus();
+  }
+});
 
 async function handleSaveProfile(): Promise<void> {
   if (!name.value.trim()) return;
@@ -128,7 +229,7 @@ async function handleChangePassword(): Promise<void> {
 <template>
   <Dialog
     :open="props.open"
-    title="User Settings"
+    title="Settings"
     @close="emit('close')"
   >
     <div class="space-y-5 -mt-3">
@@ -148,6 +249,22 @@ async function handleChangePassword(): Promise<void> {
           @click="activeTab = 'security'"
         >
           Security
+        </button>
+        <button
+          type="button"
+          class="px-3 py-2 text-sm font-medium transition-colors border-b-2 -mb-px"
+          :class="activeTab === 'voice' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'"
+          @click="activeTab = 'voice'"
+        >
+          Voice
+        </button>
+        <button
+          type="button"
+          class="px-3 py-2 text-sm font-medium transition-colors border-b-2 -mb-px"
+          :class="activeTab === 'observability' ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'"
+          @click="activeTab = 'observability'"
+        >
+          Observability
         </button>
       </div>
 
@@ -199,7 +316,7 @@ async function handleChangePassword(): Promise<void> {
       </form>
 
       <form
-        v-else
+        v-else-if="activeTab === 'security'"
         class="space-y-5"
         @submit.prevent="handleChangePassword"
       >
@@ -268,6 +385,175 @@ async function handleChangePassword(): Promise<void> {
           </Button>
         </div>
       </form>
+
+      <div
+        v-else-if="activeTab === 'voice'"
+        class="space-y-5"
+      >
+        <div class="space-y-2">
+          <Label>ElevenLabs Credential</Label>
+          <p class="text-xs text-muted-foreground">
+            Used to read messages aloud and power interactive voice mode in chat.
+          </p>
+          <Select
+            v-model="selectedTtsCredentialId"
+            :options="credentialOptions"
+          />
+          <Button
+            variant="outline"
+            type="button"
+            class="mt-1"
+            @click="goToCredentialsTab"
+          >
+            Add credential
+          </Button>
+        </div>
+
+        <div class="space-y-2">
+          <Label>Voice</Label>
+          <Select
+            v-model="selectedVoiceId"
+            :options="voiceOptions"
+            :disabled="!selectedTtsCredentialId || loadingVoices"
+          />
+          <p
+            v-if="voiceError"
+            class="text-xs text-destructive"
+          >
+            {{ voiceError }}
+          </p>
+        </div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <Button
+            variant="outline"
+            type="button"
+            @click="emit('close')"
+          >
+            Cancel
+          </Button>
+          <Button
+            type="button"
+            :loading="savingVoice"
+            :disabled="!selectedTtsCredentialId || !selectedVoiceId"
+            @click="handleSaveVoice"
+          >
+            Save Voice Settings
+          </Button>
+        </div>
+      </div>
+
+      <div
+        v-else
+        class="space-y-5"
+      >
+        <p class="text-xs text-muted-foreground">
+          OpenTelemetry traces every workflow and node execution so you can inspect them in
+          any OTLP-compatible backend (Jaeger, Grafana Tempo, Honeycomb, Datadog, and more).
+          Configure it with the <code>HEYM_OTEL_*</code> environment variables; this panel is
+          read-only.
+        </p>
+
+        <div
+          v-if="loadingObservability"
+          class="text-xs text-muted-foreground"
+        >
+          Loading status…
+        </div>
+
+        <div
+          v-else-if="observabilityStatus"
+          class="space-y-3"
+        >
+          <div class="flex items-center gap-2">
+            <span class="text-sm font-medium">Status</span>
+            <span
+              class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold"
+              :class="observabilityStatus.enabled
+                ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400'
+                : 'bg-muted text-muted-foreground'"
+            >
+              {{ observabilityStatus.enabled ? "Enabled" : "Disabled" }}
+            </span>
+          </div>
+
+          <dl class="grid grid-cols-[max-content_1fr] items-baseline gap-x-4 gap-y-1.5 text-sm">
+            <dt class="text-muted-foreground">
+              Service name
+            </dt>
+            <dd class="font-mono text-xs break-all">
+              {{ observabilityStatus.service_name }}
+            </dd>
+
+            <template v-if="observabilityStatus.enabled">
+              <dt class="text-muted-foreground">
+                OTLP endpoint
+              </dt>
+              <dd class="font-mono text-xs break-all">
+                {{ observabilityStatus.endpoint || "(SDK default)" }}
+              </dd>
+
+              <dt class="text-muted-foreground">
+                Sampler ratio
+              </dt>
+              <dd class="font-mono text-xs">
+                {{ observabilityStatus.sampler_ratio }}
+              </dd>
+
+              <dt class="text-muted-foreground">
+                Capture node I/O
+              </dt>
+              <dd class="font-mono text-xs">
+                {{ observabilityStatus.capture_node_io ? "on" : "off" }}
+              </dd>
+
+              <dt class="text-muted-foreground">
+                Instrumented
+              </dt>
+              <dd class="text-xs">
+                {{ observabilityStatus.instrumented.join(", ") }}
+              </dd>
+
+              <dt class="text-muted-foreground">
+                Spans
+              </dt>
+              <dd class="text-xs">
+                {{ observabilityStatus.spans.join(", ") }}
+              </dd>
+            </template>
+          </dl>
+
+          <div
+            v-if="!observabilityStatus.enabled"
+            class="rounded-lg border border-border bg-muted/40 p-3 text-xs text-muted-foreground space-y-1"
+          >
+            <p class="font-medium text-foreground">
+              Enable tracing
+            </p>
+            <p>Set these environment variables on the backend, then restart:</p>
+            <pre class="mt-1 whitespace-pre-wrap font-mono leading-relaxed">HEYM_OTEL_ENABLED=true
+HEYM_OTEL_EXPORTER_OTLP_ENDPOINT=http://collector:4318
+HEYM_OTEL_EXPORTER_OTLP_HEADERS=authorization=Bearer &lt;token&gt;</pre>
+          </div>
+        </div>
+
+        <div
+          v-else
+          class="text-xs text-destructive"
+        >
+          Could not load observability status.
+        </div>
+
+        <div class="flex justify-end gap-3 pt-2">
+          <Button
+            variant="outline"
+            type="button"
+            @click="emit('close')"
+          >
+            Close
+          </Button>
+        </div>
+      </div>
     </div>
   </Dialog>
 </template>

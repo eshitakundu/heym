@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
-import { BookOpen, ExternalLink, LogOut, Moon, Search, Sun, User } from "lucide-vue-next";
+import { BookOpen, ExternalLink, LogOut, Moon, Search, Settings, Sun } from "lucide-vue-next";
 
 import UserSettingsDialog from "@/components/Layout/UserSettingsDialog.vue";
 import Button from "@/components/ui/Button.vue";
@@ -9,6 +9,7 @@ import { onDismissOverlays, pushOverlayState } from "@/composables/useOverlayBac
 import { useAuthStore } from "@/stores/auth";
 import { useThemeStore } from "@/stores/theme";
 import { useVersionStore } from "@/stores/version";
+import { useVoiceStore } from "@/stores/voice";
 
 defineProps<{
   onOpenCommandPalette?: () => void;
@@ -19,7 +20,18 @@ const router = useRouter();
 const authStore = useAuthStore();
 const themeStore = useThemeStore();
 const versionStore = useVersionStore();
+const voiceStore = useVoiceStore();
 const showSettingsDialog = ref(false);
+const settingsInitialTab = ref<"profile" | "security" | "voice" | "observability">("profile");
+
+watch(
+  () => voiceStore.openVoiceSettingsSignal,
+  () => {
+    settingsInitialTab.value = "voice";
+    showSettingsDialog.value = true;
+    pushOverlayState();
+  },
+);
 
 const appVersion = computed((): string => {
   return versionStore.displayVersion;
@@ -47,12 +59,12 @@ async function handleLogout(): Promise<void> {
         <div class="logo-link flex items-center gap-3 font-semibold group">
           <router-link
             to="/"
-            class="logo-icon flex items-center justify-center w-10 h-10 rounded-xl overflow-hidden cursor-pointer"
+            class="logo-icon flex items-center justify-center w-9 h-9 cursor-pointer"
           >
             <img
               src="/fav.svg"
               alt="Heym"
-              class="block w-10 h-10"
+              class="block w-9 h-9"
             >
           </router-link>
           <div class="flex flex-col">
@@ -101,11 +113,11 @@ async function handleLogout(): Promise<void> {
           v-if="authStore.user"
           type="button"
           class="user-badge hidden md:flex items-center gap-2.5 text-sm mr-2 px-3 py-2 rounded-xl cursor-pointer hover:opacity-80 transition-opacity text-left"
-          title="User Settings"
-          @click="showSettingsDialog = true; pushOverlayState()"
+          title="Settings"
+          @click="settingsInitialTab = 'profile'; showSettingsDialog = true; pushOverlayState()"
         >
           <div class="flex items-center justify-center w-7 h-7 rounded-lg bg-primary/15 text-primary shrink-0">
-            <User class="w-4 h-4" />
+            <Settings class="w-4 h-4" />
           </div>
           <span class="font-medium text-foreground">{{ authStore.user.name }}</span>
         </button>
@@ -162,6 +174,7 @@ async function handleLogout(): Promise<void> {
 
     <UserSettingsDialog
       :open="showSettingsDialog"
+      :initial-tab="settingsInitialTab"
       @close="showSettingsDialog = false"
     />
   </header>
@@ -175,13 +188,10 @@ async function handleLogout(): Promise<void> {
 }
 
 .logo-icon {
-  background: linear-gradient(135deg, #8b5cf6 0%, #6366f1 100%);
-  box-shadow: 0 4px 12px hsl(var(--primary) / 0.2);
   transition: all 0.25s cubic-bezier(0.22, 1, 0.36, 1);
 }
 
 .logo-link:hover .logo-icon {
-  box-shadow: 0 6px 20px hsl(var(--primary) / 0.3);
   transform: translateY(-1px);
 }
 

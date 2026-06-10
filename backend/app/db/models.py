@@ -44,6 +44,7 @@ class CredentialType(str, PyEnum):
     flaresolverr = "flaresolverr"
     google_sheets = "google_sheets"
     bigquery = "bigquery"
+    elevenlabs = "elevenlabs"
 
 
 class WorkflowAuthType(str, PyEnum):
@@ -68,6 +69,12 @@ class User(Base):
     mcp_api_key: Mapped[str | None] = mapped_column(
         String(64), nullable=True, unique=True, index=True
     )
+    tts_credential_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("credentials.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    tts_voice_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -80,7 +87,10 @@ class User(Base):
         "WorkflowShare", back_populates="user", cascade="all, delete-orphan"
     )
     credentials: Mapped[list["Credential"]] = relationship(
-        "Credential", back_populates="owner", cascade="all, delete-orphan"
+        "Credential",
+        back_populates="owner",
+        cascade="all, delete-orphan",
+        foreign_keys="Credential.owner_id",
     )
     folders: Mapped[list["Folder"]] = relationship(
         "Folder", back_populates="owner", cascade="all, delete-orphan"
@@ -415,6 +425,31 @@ class ExecutionHistory(Base):
     )
 
 
+class ActiveWorkflowExecution(Base):
+    """Cross-worker registry of executions that are currently running."""
+
+    __tablename__ = "active_workflow_executions"
+
+    execution_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    workflow_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    worker_id: Mapped[str] = mapped_column(String(128), nullable=False, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    cancel_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class WorkflowAnalyticsSnapshot(Base):
     __tablename__ = "workflow_analytics_snapshots"
     __table_args__ = (
@@ -537,6 +572,7 @@ class LLMPricingOverride(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
+    provider: Mapped[str | None] = mapped_column(String(50), nullable=True)
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     input_per_1m_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
     output_per_1m_usd: Mapped[Decimal] = mapped_column(Numeric(12, 6), nullable=False)
@@ -675,7 +711,9 @@ class Credential(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    owner: Mapped["User"] = relationship("User", back_populates="credentials")
+    owner: Mapped["User"] = relationship(
+        "User", back_populates="credentials", foreign_keys="Credential.owner_id"
+    )
     shares: Mapped[list["CredentialShare"]] = relationship(
         "CredentialShare", back_populates="credential", cascade="all, delete-orphan"
     )

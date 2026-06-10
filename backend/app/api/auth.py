@@ -1,10 +1,12 @@
+from urllib.parse import urlparse
+
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_client_ip, get_current_user
 from app.config import settings
-from app.db.models import User
+from app.db.models import CredentialType, User
 from app.db.session import get_db
 from app.models.schemas import (
     PasswordChangeRequest,
@@ -26,10 +28,32 @@ from app.services.auth import (
     verify_refresh_token,
 )
 from app.services.auth_rate_limiter import login_limiter, register_limiter
+from app.services.credential_access import get_accessible_credential
 
 router = APIRouter()
 
-_COOKIE_SECURE = not settings.cors_origins.startswith("http://localhost")
+
+def _is_local_http_origin(origin: str) -> bool:
+    """Return True when an origin is plain HTTP for a local development host."""
+    parsed = urlparse(origin.strip())
+    hostname = parsed.hostname or ""
+    return parsed.scheme == "http" and hostname in {"localhost", "127.0.0.1", "::1"}
+
+
+def _should_use_secure_auth_cookies(frontend_url: str, cors_origins: list[str]) -> bool:
+    """Use insecure cookies only for explicit local HTTP development origins."""
+    frontend = frontend_url.strip()
+    if frontend and not _is_local_http_origin(frontend):
+        return True
+
+    origins = [origin.strip() for origin in cors_origins if origin.strip()]
+    if not origins:
+        return not frontend or not _is_local_http_origin(frontend)
+
+    return not all(_is_local_http_origin(origin) for origin in origins)
+
+
+_COOKIE_SECURE = _should_use_secure_auth_cookies(settings.frontend_url, settings.cors_origins_list)
 _ACCESS_COOKIE_MAX_AGE = settings.jwt_access_token_expire_minutes * 60
 _REFRESH_COOKIE_MAX_AGE = settings.jwt_refresh_token_expire_days * 86400
 
@@ -222,6 +246,23 @@ async def update_me(
         current_user.name = user_data.name
     if user_data.user_rules is not None:
         current_user.user_rules = user_data.user_rules
+    if user_data.tts_credential_id is not None:
+        credential = await get_accessible_credential(
+            db, user_data.tts_credential_id, current_user.id
+        )
+        if credential is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Credential not found",
+            )
+        if credential.type != CredentialType.elevenlabs:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="TTS credential must be an ElevenLabs credential",
+            )
+        current_user.tts_credential_id = user_data.tts_credential_id
+    if user_data.tts_voice_id is not None:
+        current_user.tts_voice_id = user_data.tts_voice_id or None
 
     await db.flush()
     await db.refresh(current_user)

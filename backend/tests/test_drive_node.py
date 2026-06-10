@@ -929,16 +929,19 @@ class DriveNodeDownloadUrlTests(unittest.TestCase):
 
         with (
             patch("app.db.session.SessionLocal", return_value=db_mock),
-            patch("app.services.file_storage._storage_root") as mock_root,
+            patch("app.services.file_storage._safe_storage_path", return_value=storage_path_mock),
             patch(
                 "app.services.file_storage.build_download_url",
                 return_value="https://heym.run/api/files/dl/dltoken",
+            ),
+            patch(
+                "app.services.workflow_executor.socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
             ),
             patch("httpx.Client") as mock_client_cls,
             patch("secrets.token_urlsafe", return_value="dltoken"),
         ):
             mock_client_cls.return_value.__enter__.return_value.get.return_value = http_response
-            mock_root.return_value.__truediv__ = MagicMock(return_value=storage_path_mock)
 
             result = executor.execute(
                 workflow_id=uuid.uuid4(),
@@ -958,6 +961,7 @@ class DriveNodeDownloadUrlTests(unittest.TestCase):
     ) -> MagicMock:
         resp = MagicMock()
         resp.content = content
+        resp.status_code = 200
         resp.headers = {
             "content-type": content_type,
             "content-disposition": content_disposition,
@@ -1038,6 +1042,151 @@ class DriveNodeDownloadUrlTests(unittest.TestCase):
         self.assertEqual(nr["status"], "success")
         self.assertEqual(nr["output"]["filename"], "data.csv")
 
+    def test_download_url_rejects_unsafe_content_disposition_filename(self) -> None:
+        """Remote filenames cannot escape the generated-file directory."""
+        owner_id = uuid.uuid4()
+        file_bytes = b"evil"
+        db = MagicMock()
+        db.__enter__ = MagicMock(return_value=db)
+        db.__exit__ = MagicMock(return_value=False)
+        db.flush = MagicMock()
+        db.commit = MagicMock()
+        db.add = MagicMock()
+
+        http_resp = self._make_http_response(
+            file_bytes,
+            content_type="text/plain",
+            content_disposition='attachment; filename="../evil.txt"',
+        )
+        storage_path = self._make_storage_path()
+
+        nr = self._run_download_workflow(
+            {
+                "label": "dl",
+                "driveOperation": "downloadUrl",
+                "driveSourceUrl": "https://example.com/file.txt",
+            },
+            owner_id,
+            db,
+            http_resp,
+            storage_path,
+        )
+
+        self.assertEqual(nr["status"], "error")
+        self.assertIn("Filename cannot contain path components", nr["error"])
+        storage_path.write_bytes.assert_not_called()
+
+    def test_download_url_rejects_private_ip_before_fetch(self) -> None:
+        """Private/internal targets are blocked before httpx connects."""
+        from app.services.workflow_executor import WorkflowExecutor
+
+        owner_id = uuid.uuid4()
+        nodes, edges = _make_workflow(
+            {
+                "label": "dl",
+                "driveOperation": "downloadUrl",
+                "driveSourceUrl": "http://127.0.0.1/metadata",
+            }
+        )
+        executor = WorkflowExecutor(nodes=nodes, edges=edges)
+        executor.trace_user_id = owner_id
+
+        with patch("httpx.Client") as mock_client_cls:
+            result = executor.execute(
+                workflow_id=uuid.uuid4(),
+                initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+            )
+
+        nr = next((r for r in result.node_results if r["node_type"] == "drive"), None)
+        self.assertIsNotNone(nr)
+        self.assertEqual(nr["status"], "error")
+        self.assertIn("globally routable", nr["error"])
+        mock_client_cls.assert_not_called()
+
+    def test_download_url_rejects_non_global_resolved_address_before_fetch(self) -> None:
+        """Non-global DNS answers such as carrier-grade NAT are blocked."""
+        from app.services.workflow_executor import WorkflowExecutor
+
+        owner_id = uuid.uuid4()
+        nodes, edges = _make_workflow(
+            {
+                "label": "dl",
+                "driveOperation": "downloadUrl",
+                "driveSourceUrl": "https://example.com/metadata",
+            }
+        )
+        executor = WorkflowExecutor(nodes=nodes, edges=edges)
+        executor.trace_user_id = owner_id
+
+        with (
+            patch(
+                "app.services.workflow_executor.socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("100.64.0.1", 0))],
+            ),
+            patch("httpx.Client") as mock_client_cls,
+        ):
+            result = executor.execute(
+                workflow_id=uuid.uuid4(),
+                initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+            )
+
+        nr = next((r for r in result.node_results if r["node_type"] == "drive"), None)
+        self.assertIsNotNone(nr)
+        self.assertEqual(nr["status"], "error")
+        self.assertIn("globally routable", nr["error"])
+        mock_client_cls.assert_not_called()
+
+    def test_download_url_connects_to_validated_address_with_original_host(self) -> None:
+        """The validated address is pinned for the HTTP request."""
+        from app.services.workflow_executor import _fetch_drive_download_url
+
+        response = self._make_http_response(b"ok", content_type="text/plain")
+        client = MagicMock()
+        client.get.return_value = response
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+
+        with (
+            patch(
+                "app.services.workflow_executor.socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
+            ) as mock_getaddrinfo,
+            patch("httpx.Client", return_value=client),
+        ):
+            result = _fetch_drive_download_url("https://example.com/downloads/file.txt")
+
+        self.assertIs(result, response)
+        mock_getaddrinfo.assert_called_once()
+        client.get.assert_called_once_with(
+            "https://93.184.216.34/downloads/file.txt",
+            headers={"Host": "example.com"},
+            extensions={"sni_hostname": "example.com"},
+        )
+
+    def test_download_url_rejects_redirect_to_private_ip_before_following(self) -> None:
+        """Redirect targets are validated before a follow-up request is made."""
+        from app.services.workflow_executor import _fetch_drive_download_url
+
+        redirect_resp = MagicMock()
+        redirect_resp.status_code = 302
+        redirect_resp.headers = {"location": "http://127.0.0.1/metadata"}
+        redirect_resp.raise_for_status = MagicMock()
+
+        client = MagicMock()
+        client.get.return_value = redirect_resp
+        client.__enter__ = MagicMock(return_value=client)
+        client.__exit__ = MagicMock(return_value=False)
+
+        with patch("httpx.Client", return_value=client):
+            with self.assertRaisesRegex(ValueError, "globally routable"):
+                _fetch_drive_download_url("http://93.184.216.34/start")
+
+        client.get.assert_called_once_with(
+            "http://93.184.216.34/start",
+            headers={"Host": "93.184.216.34"},
+            extensions=None,
+        )
+
     def test_download_url_missing_url_raises(self) -> None:
         """Empty driveSourceUrl results in an error."""
         owner_id = uuid.uuid4()
@@ -1100,6 +1249,10 @@ class DriveNodeDownloadUrlTests(unittest.TestCase):
             patch("app.db.session.SessionLocal", return_value=db),
             patch("app.services.file_storage._storage_root"),
             patch("app.services.file_storage.build_download_url", return_value=""),
+            patch(
+                "app.services.workflow_executor.socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
+            ),
             patch("httpx.Client") as mock_client_cls,
         ):
             mock_client_cls.return_value.__enter__.return_value.get.side_effect = raise_http_error
@@ -1113,6 +1266,490 @@ class DriveNodeDownloadUrlTests(unittest.TestCase):
         self.assertIsNotNone(nr)
         self.assertEqual(nr["status"], "error")
         self.assertIn("404", nr["error"])
+
+
+# ---------------------------------------------------------------------------
+# Task — Drive convertFile helper functions
+# ---------------------------------------------------------------------------
+
+
+class DriveConvertHelpersTests(unittest.TestCase):
+    """Unit tests for the three module-level helpers used by convertFile."""
+
+    # --- _detect_pandoc_format ---
+
+    def test_detect_markdown_by_mime(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertEqual(_detect_pandoc_format("text/markdown", "doc.md"), "markdown")
+
+    def test_detect_html_by_mime(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertEqual(_detect_pandoc_format("text/html", "page.html"), "html")
+
+    def test_detect_docx_by_mime(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertEqual(
+            _detect_pandoc_format(
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "doc.docx",
+            ),
+            "docx",
+        )
+
+    def test_detect_plain_by_mime(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertEqual(_detect_pandoc_format("text/plain", "notes.txt"), "markdown")
+
+    def test_detect_csv_by_mime(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertEqual(_detect_pandoc_format("text/csv", "data.csv"), "csv")
+
+    def test_detect_md_by_extension_fallback(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertEqual(_detect_pandoc_format("application/octet-stream", "readme.md"), "markdown")
+
+    def test_detect_unsupported_returns_none(self) -> None:
+        from app.services.workflow_executor import _detect_pandoc_format
+
+        self.assertIsNone(_detect_pandoc_format("application/zip", "archive.zip"))
+
+    # --- _extract_pdf_text ---
+
+    def test_extract_pdf_text_returns_string(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from app.services.workflow_executor import _extract_pdf_text
+
+        mock_page = MagicMock()
+        mock_page.extract_text.return_value = "Hello from PDF"
+        mock_reader = MagicMock()
+        mock_reader.pages = [mock_page]
+
+        with patch("pypdf.PdfReader", return_value=mock_reader):
+            result = _extract_pdf_text(b"fake-pdf-bytes")
+
+        self.assertEqual(result, "Hello from PDF")
+
+    def test_extract_pdf_text_joins_pages(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from app.services.workflow_executor import _extract_pdf_text
+
+        pages = [MagicMock(), MagicMock()]
+        pages[0].extract_text.return_value = "Page 1"
+        pages[1].extract_text.return_value = "Page 2"
+        mock_reader = MagicMock()
+        mock_reader.pages = pages
+
+        with patch("pypdf.PdfReader", return_value=mock_reader):
+            result = _extract_pdf_text(b"fake-pdf-bytes")
+
+        self.assertEqual(result, "Page 1\n\nPage 2")
+
+    # --- _convert_image ---
+
+    def test_convert_image_png_to_jpg(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from app.services.workflow_executor import _convert_image
+
+        fake_output = b"fake-jpeg-bytes"
+
+        mock_img = MagicMock()
+        mock_img.mode = "RGB"
+
+        def fake_save(buf, format):
+            buf.write(fake_output)
+
+        mock_img.save.side_effect = fake_save
+        mock_img.convert.return_value = mock_img
+
+        with patch("PIL.Image.open", return_value=mock_img):
+            out_bytes, out_mime = _convert_image(b"png-bytes", "jpg")
+
+        self.assertEqual(out_bytes, fake_output)
+        self.assertEqual(out_mime, "image/jpeg")
+        mock_img.save.assert_called_once()
+        call_kwargs = mock_img.save.call_args
+        self.assertEqual(call_kwargs[1]["format"], "JPEG")
+
+    def test_convert_image_unsupported_format_raises(self) -> None:
+        from app.services.workflow_executor import _convert_image
+
+        with self.assertRaises(ValueError) as ctx:
+            _convert_image(b"bytes", "docx")
+        self.assertIn("unsupported image output format", str(ctx.exception))
+
+    def test_convert_image_rgba_to_jpg_converts_to_rgb(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from app.services.workflow_executor import _convert_image
+
+        mock_img = MagicMock()
+        mock_img.mode = "RGBA"
+        rgb_img = MagicMock()
+        rgb_img.mode = "RGB"
+        mock_img.convert.return_value = rgb_img
+
+        def fake_save(buf, format):
+            buf.write(b"data")
+
+        rgb_img.save.side_effect = fake_save
+
+        with patch("PIL.Image.open", return_value=mock_img):
+            _convert_image(b"png-rgba-bytes", "jpg")
+
+        mock_img.convert.assert_called_once_with("RGB")
+        rgb_img.save.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task — Drive convertFile operation (executor integration)
+# ---------------------------------------------------------------------------
+
+
+def _make_convert_db_mock(file_row: object) -> MagicMock:
+    """DB mock for convertFile: query returns the source file, then two objects are added."""
+    fake_db = MagicMock()
+    fake_db.__enter__ = MagicMock(return_value=fake_db)
+    fake_db.__exit__ = MagicMock(return_value=False)
+    fake_db.query.return_value.filter.return_value.first.return_value = file_row
+    fake_db.flush = MagicMock()
+    fake_db.commit = MagicMock()
+    added: list = []
+    fake_db.add.side_effect = lambda obj: added.append(obj)
+    fake_db._added = added
+    return fake_db
+
+
+class DriveNodeConvertFileTests(unittest.TestCase):
+    """Drive node convertFile operation."""
+
+    def _run_convert_workflow(
+        self,
+        drive_data: dict,
+        owner_id: uuid.UUID,
+        db_mock: MagicMock,
+        src_bytes: bytes,
+        converted_bytes: bytes,
+        converted_mime: str,
+        is_image: bool = False,
+    ) -> dict:
+        from app.services.workflow_executor import WorkflowExecutor
+
+        nodes, edges = _make_workflow(drive_data)
+        executor = WorkflowExecutor(nodes=nodes, edges=edges)
+        executor.trace_user_id = owner_id
+
+        with (
+            patch("app.db.session.SessionLocal", return_value=db_mock),
+            patch("app.services.file_storage._storage_root") as mock_root,
+            patch(
+                "app.services.file_storage.build_download_url",
+                return_value="/api/files/dl/convtoken",
+            ),
+            patch("secrets.token_urlsafe", return_value="convtoken"),
+        ):
+            storage_path = MagicMock()
+            storage_path.exists.return_value = True
+            storage_path.read_bytes.return_value = src_bytes
+
+            mock_root.return_value.__truediv__ = MagicMock(return_value=storage_path)
+
+            if is_image:
+                with patch(
+                    "app.services.workflow_executor._convert_image",
+                    return_value=(converted_bytes, converted_mime),
+                ):
+                    result = executor.execute(
+                        workflow_id=uuid.uuid4(),
+                        initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+                    )
+            else:
+                with (
+                    patch(
+                        "app.services.workflow_executor._extract_pdf_text",
+                        return_value="extracted text",
+                    ),
+                    patch("pypandoc.convert_file") as mock_pandoc,
+                ):
+
+                    def write_output(src, fmt, outputfile, format, extra_args=None):
+                        with open(outputfile, "wb") as fh:
+                            fh.write(converted_bytes)
+
+                    mock_pandoc.side_effect = write_output
+                    result = executor.execute(
+                        workflow_id=uuid.uuid4(),
+                        initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+                    )
+
+        nr = next((r for r in result.node_results if r["node_type"] == "drive"), None)
+        if nr is None:
+            raise AssertionError(
+                f"Drive node result not found. Errors: "
+                f"{[r for r in result.node_results if r.get('status') == 'error']}"
+            )
+        return nr
+
+    def test_convert_md_to_html_success(self) -> None:
+        owner_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        file_row = SimpleNamespace(
+            id=file_id,
+            owner_id=owner_id,
+            filename="readme.md",
+            mime_type="text/markdown",
+            size_bytes=100,
+            storage_path=f"{owner_id}/{file_id}/readme.md",
+        )
+        db = _make_convert_db_mock(file_row)
+
+        nr = self._run_convert_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": str(file_id),
+                "driveConvertTargetFormat": "html",
+            },
+            owner_id,
+            db,
+            src_bytes=b"# Hello",
+            converted_bytes=b"<h1>Hello</h1>",
+            converted_mime="text/html",
+        )
+
+        self.assertEqual(nr["status"], "success")
+        self.assertEqual(nr["output"]["operation"], "convertFile")
+        self.assertEqual(nr["output"]["filename"], "readme.html")
+        self.assertEqual(nr["output"]["mime_type"], "text/html")
+        self.assertIn("id", nr["output"])
+        self.assertIn("download_url", nr["output"])
+
+    def test_convert_pdf_to_txt_success(self) -> None:
+        owner_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        file_row = SimpleNamespace(
+            id=file_id,
+            owner_id=owner_id,
+            filename="report.pdf",
+            mime_type="application/pdf",
+            size_bytes=500,
+            storage_path=f"{owner_id}/{file_id}/report.pdf",
+        )
+        db = _make_convert_db_mock(file_row)
+
+        nr = self._run_convert_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": str(file_id),
+                "driveConvertTargetFormat": "txt",
+            },
+            owner_id,
+            db,
+            src_bytes=b"%PDF-fake",
+            converted_bytes=b"extracted text",
+            converted_mime="text/plain",
+        )
+
+        self.assertEqual(nr["status"], "success")
+        self.assertEqual(nr["output"]["filename"], "report.txt")
+        self.assertEqual(nr["output"]["mime_type"], "text/plain")
+
+    def test_convert_image_png_to_jpg_success(self) -> None:
+        owner_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        file_row = SimpleNamespace(
+            id=file_id,
+            owner_id=owner_id,
+            filename="photo.png",
+            mime_type="image/png",
+            size_bytes=200,
+            storage_path=f"{owner_id}/{file_id}/photo.png",
+        )
+        db = _make_convert_db_mock(file_row)
+
+        nr = self._run_convert_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": str(file_id),
+                "driveConvertTargetFormat": "jpg",
+            },
+            owner_id,
+            db,
+            src_bytes=b"fake-png",
+            converted_bytes=b"fake-jpeg",
+            converted_mime="image/jpeg",
+            is_image=True,
+        )
+
+        self.assertEqual(nr["status"], "success")
+        self.assertEqual(nr["output"]["filename"], "photo.jpg")
+        self.assertEqual(nr["output"]["mime_type"], "image/jpeg")
+
+    def test_convert_unsupported_input_format_raises(self) -> None:
+        owner_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        file_row = SimpleNamespace(
+            id=file_id,
+            owner_id=owner_id,
+            filename="archive.zip",
+            mime_type="application/zip",
+            size_bytes=1000,
+            storage_path=f"{owner_id}/{file_id}/archive.zip",
+        )
+        db = _make_convert_db_mock(file_row)
+
+        from app.services.workflow_executor import WorkflowExecutor
+
+        nodes, edges = _make_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": str(file_id),
+                "driveConvertTargetFormat": "txt",
+            }
+        )
+        executor = WorkflowExecutor(nodes=nodes, edges=edges)
+        executor.trace_user_id = owner_id
+
+        storage_path = MagicMock()
+        storage_path.exists.return_value = True
+        storage_path.read_bytes.return_value = b"zip-data"
+
+        with (
+            patch("app.db.session.SessionLocal", return_value=db),
+            patch("app.services.file_storage._storage_root") as mock_root,
+            patch("app.services.file_storage.build_download_url", return_value=""),
+        ):
+            mock_root.return_value.__truediv__ = MagicMock(return_value=storage_path)
+            result = executor.execute(
+                workflow_id=uuid.uuid4(),
+                initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+            )
+
+        nr = next((r for r in result.node_results if r["node_type"] == "drive"), None)
+        self.assertIsNotNone(nr)
+        self.assertEqual(nr["status"], "error")
+        self.assertIn("does not support input format", nr["error"])
+
+    def test_convert_image_to_doc_format_raises(self) -> None:
+        owner_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        file_row = SimpleNamespace(
+            id=file_id,
+            owner_id=owner_id,
+            filename="photo.png",
+            mime_type="image/png",
+            size_bytes=200,
+            storage_path=f"{owner_id}/{file_id}/photo.png",
+        )
+        db = _make_convert_db_mock(file_row)
+
+        from app.services.workflow_executor import WorkflowExecutor
+
+        nodes, edges = _make_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": str(file_id),
+                "driveConvertTargetFormat": "docx",
+            }
+        )
+        executor = WorkflowExecutor(nodes=nodes, edges=edges)
+        executor.trace_user_id = owner_id
+
+        storage_path = MagicMock()
+        storage_path.exists.return_value = True
+        storage_path.read_bytes.return_value = b"png-data"
+
+        with (
+            patch("app.db.session.SessionLocal", return_value=db),
+            patch("app.services.file_storage._storage_root") as mock_root,
+            patch("app.services.file_storage.build_download_url", return_value=""),
+        ):
+            mock_root.return_value.__truediv__ = MagicMock(return_value=storage_path)
+            result = executor.execute(
+                workflow_id=uuid.uuid4(),
+                initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+            )
+
+        nr = next((r for r in result.node_results if r["node_type"] == "drive"), None)
+        self.assertIsNotNone(nr)
+        self.assertEqual(nr["status"], "error")
+        self.assertIn("cannot convert image", nr["error"])
+
+    def test_convert_missing_file_id_raises(self) -> None:
+        owner_id = uuid.uuid4()
+        db = _make_convert_db_mock(None)
+
+        from app.services.workflow_executor import WorkflowExecutor
+
+        nodes, edges = _make_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": "",
+                "driveConvertTargetFormat": "html",
+            }
+        )
+        executor = WorkflowExecutor(nodes=nodes, edges=edges)
+        executor.trace_user_id = owner_id
+
+        with (
+            patch("app.db.session.SessionLocal", return_value=db),
+            patch("app.services.file_storage._storage_root"),
+            patch("app.services.file_storage.build_download_url", return_value=""),
+        ):
+            result = executor.execute(
+                workflow_id=uuid.uuid4(),
+                initial_inputs={"headers": {}, "query": {}, "body": {"text": "hi"}},
+            )
+
+        nr = next((r for r in result.node_results if r["node_type"] == "drive"), None)
+        self.assertIsNotNone(nr)
+        self.assertEqual(nr["status"], "error")
+        self.assertIn("fileId is required", nr["error"])
+
+    def test_convert_output_is_new_file(self) -> None:
+        """Converted file id in output must differ from source file id."""
+        owner_id = uuid.uuid4()
+        file_id = uuid.uuid4()
+        file_row = SimpleNamespace(
+            id=file_id,
+            owner_id=owner_id,
+            filename="doc.md",
+            mime_type="text/markdown",
+            size_bytes=50,
+            storage_path=f"{owner_id}/{file_id}/doc.md",
+        )
+        db = _make_convert_db_mock(file_row)
+
+        nr = self._run_convert_workflow(
+            {
+                "label": "convert",
+                "driveOperation": "convertFile",
+                "driveFileId": str(file_id),
+                "driveConvertTargetFormat": "txt",
+            },
+            owner_id,
+            db,
+            src_bytes=b"# Hello",
+            converted_bytes=b"Hello",
+            converted_mime="text/plain",
+        )
+
+        self.assertEqual(nr["status"], "success")
+        self.assertNotEqual(nr["output"]["id"], str(file_id))
+        self.assertEqual(len(db._added), 2)
 
 
 if __name__ == "__main__":

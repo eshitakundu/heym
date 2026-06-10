@@ -57,6 +57,7 @@ import type { DataTableListItem } from "@/types/dataTable";
 import type { GeneratedFile } from "@/types/file";
 import { useAuthStore } from "@/stores/auth";
 import { useWorkflowStore, type ValidationError } from "@/stores/workflow";
+import { useRunbookPlayer } from "@/features/runbook/useRunbookPlayer";
 
 import type { NodeType } from "@/types/workflow";
 import type { WebSocketTriggerEventName } from "@/types/workflow";
@@ -1100,6 +1101,7 @@ const selectedNodeEvaluateDialogLabel = computed((): string => {
 });
 
 const isExecuting = computed(() => workflowStore.isExecuting);
+const { isRunbookPlaying } = useRunbookPlayer();
 const hasNodes = computed(() => workflowStore.nodes.length > 0);
 
 const lastExecutedNode = computed(() => {
@@ -3143,11 +3145,72 @@ const driveOperationOptions = [
   { value: "get", label: "Get File" },
   { value: "getAll", label: "Get All Files" },
   { value: "downloadUrl", label: "Download from URL" },
+  { value: "convertFile", label: "Convert File" },
   { value: "delete", label: "Delete File" },
   { value: "setPassword", label: "Set Password" },
   { value: "setTtl", label: "Set TTL (Expiry)" },
   { value: "setMaxDownloads", label: "Set Max Downloads" },
 ];
+
+const driveConvertFormatOptions = [
+  { value: "pdf", label: "PDF (.pdf)" },
+  { value: "docx", label: "Word Document (.docx)" },
+  { value: "html", label: "HTML (.html)" },
+  { value: "md", label: "Markdown (.md)" },
+  { value: "txt", label: "Plain Text (.txt)" },
+  { value: "csv", label: "CSV (.csv)" },
+  { value: "epub", label: "EPUB (.epub)" },
+  { value: "jpg", label: "JPEG Image (.jpg)" },
+  { value: "png", label: "PNG Image (.png)" },
+  { value: "bmp", label: "BMP Image (.bmp)" },
+  { value: "webp", label: "WebP Image (.webp)" },
+];
+
+const _IMAGE_MIMES = new Set([
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/bmp",
+  "image/webp",
+]);
+
+const _MIME_TO_FORMAT: Record<string, string> = {
+  "application/pdf": "pdf",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document": "docx",
+  "text/html": "html",
+  "text/markdown": "md",
+  "text/plain": "txt",
+  "text/csv": "csv",
+  "application/epub+zip": "epub",
+  "application/json": "json",
+  "image/jpeg": "jpg",
+  "image/jpg": "jpg",
+  "image/png": "png",
+  "image/bmp": "bmp",
+  "image/webp": "webp",
+};
+
+const driveConvertFormatOptionsFiltered = computed(() => {
+  const n = selectedNode.value;
+  if (!n || n.type !== "drive" || n.data.driveOperation !== "convertFile") {
+    return driveConvertFormatOptions;
+  }
+  const fileId = n.data.driveFileId;
+  if (!fileId) return driveConvertFormatOptions;
+  const file = driveFiles.value.find((f) => f.id === fileId);
+  if (!file) return driveConvertFormatOptions;
+
+  const inputFormat = _MIME_TO_FORMAT[file.mime_type];
+  const isImage = _IMAGE_MIMES.has(file.mime_type);
+
+  const allowed = isImage
+    ? ["jpg", "png", "bmp", "webp"]
+    : ["pdf", "docx", "html", "md", "txt", "csv", "epub"];
+
+  return driveConvertFormatOptions.filter(
+    (o) => allowed.includes(o.value) && o.value !== inputFormat,
+  );
+});
 
 const dataTableOptions = computed(() => {
   const options = [{ value: "", label: "Select table..." }];
@@ -5260,11 +5323,13 @@ onUnmounted(() => {
         <span class="hidden md:inline">Properties</span>
       </button>
       <button
+        data-runbook-run
         :class="cn(
           'flex-1 px-3 py-2 min-h-[44px] text-sm font-medium transition-all flex items-center justify-center gap-2 rounded-lg',
           activeTab === 'config'
             ? 'text-primary bg-primary/10 shadow-sm'
-            : 'text-muted-foreground hover:text-foreground hover:bg-muted/50'
+            : 'text-muted-foreground hover:text-foreground hover:bg-muted/50',
+          isRunbookPlaying && 'runbook-pulse'
         )"
         @click="activeTab = 'config'"
       >
@@ -6112,6 +6177,21 @@ onUnmounted(() => {
               </div>
 
               <div class="space-y-2 pt-2 border-t">
+                <Label>Request Timeout (seconds)</Label>
+                <Input
+                  type="number"
+                  :model-value="String(selectedNode.data.requestTimeoutSeconds ?? 60)"
+                  min="1"
+                  max="3600"
+                  placeholder="60"
+                  @update:model-value="updateNodeData('requestTimeoutSeconds', parseInt($event, 10) || 60)"
+                />
+                <p class="text-xs text-muted-foreground">
+                  Max seconds to wait for the model response before timing out
+                </p>
+              </div>
+
+              <div class="space-y-2 pt-2 border-t">
                 <Label>JSON Output Parser</Label>
                 <div class="flex items-center justify-between">
                   <div class="flex items-center gap-2">
@@ -6449,6 +6529,20 @@ onUnmounted(() => {
               </div>
             </div>
             <div class="space-y-2 pt-2 border-t">
+              <Label>Request Timeout (seconds)</Label>
+              <Input
+                type="number"
+                :model-value="String(selectedNode.data.requestTimeoutSeconds ?? 60)"
+                min="1"
+                max="3600"
+                placeholder="60"
+                @update:model-value="updateNodeData('requestTimeoutSeconds', parseInt($event, 10) || 60)"
+              />
+              <p class="text-xs text-muted-foreground">
+                Max seconds to wait for the model response before timing out
+              </p>
+            </div>
+            <div class="space-y-2 pt-2 border-t">
               <div class="flex items-center gap-2">
                 <input
                   id="agent-orchestrator"
@@ -6565,7 +6659,7 @@ onUnmounted(() => {
                 type="number"
                 :model-value="String(selectedNode.data.toolTimeoutSeconds ?? 30)"
                 min="1"
-                max="300"
+                max="3600"
                 placeholder="30"
                 @update:model-value="updateNodeData('toolTimeoutSeconds', parseInt($event, 10) || 30)"
               />
@@ -6692,7 +6786,7 @@ onUnmounted(() => {
                         type="number"
                         :model-value="String(conn.timeoutSeconds ?? 30)"
                         min="1"
-                        max="300"
+                        max="3600"
                         placeholder="30"
                         @update:model-value="updateAgentMCPConnection(idx, 'timeoutSeconds', parseInt($event, 10) || 30)"
                       />
@@ -6961,7 +7055,7 @@ onUnmounted(() => {
                       type="number"
                       :model-value="String(skill.timeoutSeconds ?? 30)"
                       min="1"
-                      max="300"
+                      max="3600"
                       placeholder="30"
                       @update:model-value="updateAgentSkill(idx, 'timeoutSeconds', parseInt($event, 10) || 30)"
                     />
@@ -9894,7 +9988,7 @@ onUnmounted(() => {
                   field-key="driveFileId"
                 />
               </div>
-              <template v-if="selectedNode.data.driveOperation === 'get'">
+              <template v-if="selectedNode.data.driveOperation === 'get' || selectedNode.data.driveOperation === 'convertFile'">
                 <Select
                   :model-value="selectedNode.data.driveFileId || ''"
                   :options="driveFileOptions"
@@ -10066,6 +10160,21 @@ onUnmounted(() => {
               </p>
             </div>
 
+            <div
+              v-if="selectedNode.data.driveOperation === 'convertFile'"
+              class="space-y-2"
+            >
+              <Label>Target Format</Label>
+              <Select
+                :model-value="selectedNode.data.driveConvertTargetFormat || ''"
+                :options="driveConvertFormatOptionsFiltered"
+                @update:model-value="updateNodeData('driveConvertTargetFormat', $event || undefined)"
+              />
+              <p class="text-xs text-muted-foreground">
+                Format to convert the file to
+              </p>
+            </div>
+
             <div class="rounded-lg bg-muted/50 p-3 space-y-1">
               <p class="text-xs font-medium text-foreground">
                 Output
@@ -10089,6 +10198,13 @@ onUnmounted(() => {
                 <template v-else-if="selectedNode.data.driveOperation === 'downloadUrl'">
                   <div>${{ selectedNode.data.label }}.id - new file UUID</div>
                   <div>${{ selectedNode.data.label }}.filename - file name</div>
+                  <div>${{ selectedNode.data.label }}.mime_type - MIME type</div>
+                  <div>${{ selectedNode.data.label }}.size_bytes - file size</div>
+                  <div>${{ selectedNode.data.label }}.download_url - Drive download URL</div>
+                </template>
+                <template v-else-if="selectedNode.data.driveOperation === 'convertFile'">
+                  <div>${{ selectedNode.data.label }}.id - new converted file UUID</div>
+                  <div>${{ selectedNode.data.label }}.filename - converted filename</div>
                   <div>${{ selectedNode.data.label }}.mime_type - MIME type</div>
                   <div>${{ selectedNode.data.label }}.size_bytes - file size</div>
                   <div>${{ selectedNode.data.label }}.download_url - Drive download URL</div>
@@ -11294,7 +11410,7 @@ onUnmounted(() => {
                         type="number"
                         :model-value="String(selectedNode.data.connection?.timeoutSeconds ?? 30)"
                         min="1"
-                        max="300"
+                        max="3600"
                         placeholder="30"
                         @update:model-value="updateMCPCallConnectionField('timeoutSeconds', parseInt($event, 10) || 30)"
                       />
@@ -11982,6 +12098,7 @@ onUnmounted(() => {
 
           <Button
             class="w-full min-w-0"
+            :class="isRunbookPlaying && 'runbook-pulse'"
             :loading="isExecuting"
             :disabled="!hasNodes || !!runBodyError"
             @click="handleExecute"

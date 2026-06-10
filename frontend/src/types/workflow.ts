@@ -374,6 +374,8 @@ export interface NodeData {
   agentProvidedFields?: string[];
   maxToolIterations?: number;
   toolTimeoutSeconds?: number;
+  /** Per-node LLM request timeout in seconds (passed to the model client). Default 60. */
+  requestTimeoutSeconds?: number;
   variableName?: string;
   variableValue?: string;
   variableType?: VariableType;
@@ -418,6 +420,8 @@ export interface NodeData {
   retryWaitSeconds?: number;
   onErrorEnabled?: boolean;
   retryAttempt?: number;
+  /** Transient UI flag: triggers the Runbook slide-in entrance animation in BaseNode. */
+  __runbookEntrance?: boolean;
   rabbitmqOperation?: string;
   rabbitmqExchange?: string;
   rabbitmqRoutingKey?: string;
@@ -462,7 +466,8 @@ export interface NodeData {
     | "setPassword"
     | "setTtl"
     | "setMaxDownloads"
-    | "downloadUrl";
+    | "downloadUrl"
+    | "convertFile";
   driveFileId?: string;
   driveLimit?: number;
   drivePassword?: string;
@@ -470,6 +475,7 @@ export interface NodeData {
   driveMaxDownloads?: number;
   driveIncludeBinary?: boolean;
   driveSourceUrl?: string;
+  driveConvertTargetFormat?: string;
   bqOperation?: string;
   bqProjectId?: string;
   bqQuery?: string;

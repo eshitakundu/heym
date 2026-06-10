@@ -1,7 +1,11 @@
 import os
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings
+
+# Known placeholder values that must not be used in production
+_SECRET_KEY_PLACEHOLDER = "your-super-secret-key-change-in-production-min-32-chars"
+_ENCRYPTION_KEY_PLACEHOLDER = "change_this_to_a_random_32_byte_hex_value"
 
 
 def _read_version() -> str:
@@ -21,7 +25,24 @@ class Settings(BaseSettings):
     postgres_user: str = "postgres"
     postgres_password: str = "postgres"
     postgres_db: str = "heym"
-    secret_key: str = "your-super-secret-key-change-in-production-min-32-chars"
+    secret_key: str = ""
+
+    @field_validator("secret_key")
+    @classmethod
+    def _validate_secret_key(cls, v: str) -> str:
+        """Refuse to start if SECRET_KEY is missing, a known placeholder, or too short."""
+        if not v or v == _SECRET_KEY_PLACEHOLDER:
+            raise ValueError(
+                "SECRET_KEY must be set to a cryptographically random value. "
+                "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        if len(v) < 32:
+            raise ValueError(
+                f"SECRET_KEY must be at least 32 characters long (got {len(v)}). "
+                "Generate one with: python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+            )
+        return v
+
     encryption_key: str = ""
     jwt_algorithm: str = "HS256"
     jwt_access_token_expire_minutes: int = 1440
@@ -40,9 +61,28 @@ class Settings(BaseSettings):
     docs_dir: str = ""  # Path to docs content. Empty = use frontend/src/docs/content
     file_storage_dir: str = "./data/files"
     file_max_size_mb: int = 99
+    docker_logs_enabled: bool = False
+    docker_logs_allowed_emails: str = ""
+    # Keep above file_max_size_mb so multipart metadata can fit around a max-size file.
+    request_body_max_size_mb: int = 100
     mcp_protocol_max_concurrency: int = 20
     mcp_sse_max_sessions: int = 100
     app_version: str = ""
+
+    # OpenTelemetry tracing (disabled by default -> zero overhead).
+    # Env var names use the HEYM_OTEL_ prefix to keep a dedicated namespace.
+    otel_enabled: bool = Field(default=False, validation_alias="HEYM_OTEL_ENABLED")
+    otel_exporter_otlp_endpoint: str = Field(
+        default="", validation_alias="HEYM_OTEL_EXPORTER_OTLP_ENDPOINT"
+    )
+    otel_exporter_otlp_headers: str = Field(
+        default="", validation_alias="HEYM_OTEL_EXPORTER_OTLP_HEADERS"
+    )
+    otel_service_name: str = Field(default="heym", validation_alias="HEYM_OTEL_SERVICE_NAME")
+    otel_traces_sampler_ratio: float = Field(
+        default=1.0, validation_alias="HEYM_OTEL_TRACES_SAMPLER_RATIO"
+    )
+    otel_capture_node_io: bool = Field(default=False, validation_alias="HEYM_OTEL_CAPTURE_NODE_IO")
 
     @property
     def resolved_version(self) -> str:
@@ -67,10 +107,10 @@ class Settings(BaseSettings):
     @classmethod
     def encryption_key_must_be_set(cls, v: str) -> str:
         """Refuse to start if ENCRYPTION_KEY is absent or still the known-compromised default."""
-        if not v:
+        if not v or v == _ENCRYPTION_KEY_PLACEHOLDER:
             raise ValueError(
-                "ENCRYPTION_KEY environment variable is required. "
-                "Generate a strong random key: "
+                "ENCRYPTION_KEY environment variable is required and must not be the "
+                "placeholder value. Generate a strong random key: "
                 'python -c "import secrets; print(secrets.token_hex(32))"'
             )
         return v
